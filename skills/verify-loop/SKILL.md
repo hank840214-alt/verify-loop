@@ -15,7 +15,7 @@ Pick the mode from the conversation without asking: a multi-step task is startin
 0. Deepen the task, don't widen it: what would a top professional do, where is the rawest data, which method, what result would prove it right. One line each.
 1. Write 3–5 pass/fail checkpoints in feature-map words ("a new user sees the welcome screen within one second"), not implementation.
 2. The user confirms or edits the list before work starts.
-3. Turn each checkpoint into a failing test or verification step first, then write the code. Tick each with evidence.
+3. Turn each checkpoint into a failing test or verification step first, then write the code. A different agent from the fixer writes the test and commits it first; the fixer may not edit it. Tick each with evidence.
 4. For long, overnight or unattended runs, keep `.scratch/decisions.tsv`: time | phase | decision | why | evidence | result. End with a "needs your attention" section.
 
 ## setup — audit a repo's guardrails
@@ -42,10 +42,10 @@ Pick the mode from the conversation without asking: a multi-step task is startin
 Answer the five questions in `${CLAUDE_PLUGIN_ROOT}/docs/METHOD.md` §1 in order, one line of reasoning each. For "a machine can tell", walk the correction tree (redesign → type → lint with the fix in its message → test → app-driving step) and stop at the first rung that works. Prove the check fails on the real past mistake and passes without it; attach both outputs. State/timing bugs → a TLA+ model locked in as a repo check, with a statechart. Pure invariants → consider Lean. List any old text rule this replaces as "can delete", for the user to approve.
 
 ## done — before handing over
-1. Run tests and type checks; paste the tail. Red means not done.
+1. Commit, then run the checks through `${CLAUDE_PLUGIN_ROOT}/tools/verify-evidence.sh --tests-re '<test paths>' -- <verify command>`. Paste its output unchanged into the PR's Verification section; never write that section by hand. Red means not done. If it lists changed existing tests, another agent or the user must approve that part.
 2. Produce artifacts: UI change → before/after screenshots or a short video; flow/state change → a statechart (rerun the model if one exists); bug fix → failing repro before, passing after. Name things by the feature map.
 3. Blast radius, even for small changes: list callers and shared data (file:line), write "this is safe because ___", prove that one fact by running real code.
 4. PR body, in order: Why | What changed | Scope | Tradeoffs | Blast radius | Verification (commands + output). Conventional Commits title. Never merge from here.
-5. Review by risk tier, never by the session that wrote the code: docs → green checks; normal → one fresh reviewer (strong model or Codex read-only via the dispatch script); money/login/store/data deletion → both, plus a rollback or flag.
+5. Reviewers first check that the evidence SHA equals the PR head; if not, rerun. Merge only after the user or an independent reviewer approves that SHA. Review by risk tier, never by the session that wrote the code: docs → green checks; normal → one fresh reviewer (strong model or Codex read-only via the dispatch script); money/login/store/data deletion → both, plus a rollback or flag.
 6. Fix P1/P2 findings before handing over. Append each finding to `plans/FINDINGS.md`: date | kind | one sentence | already has a check?
 7. A kind of finding seen a second time → run triage and propose the check.

@@ -12,8 +12,9 @@ If you build software by talking to Claude Code, Codex or Gemini CLI, you cannot
 |---|---|
 | `skills/verify-loop` | Say "verify". The model picks a mode: **start** (agree on 3–5 checkpoints first), **setup** (audit a repo's guardrails), **map** (feature map + a CLI that drives the real app), **triage** (turn a mistake into a check), **done** (evidence, blast radius, risk-tiered review). |
 | `skills/debug` | Say "debug". The model routes: ordinary bug, performance, state/timing, or blast radius. |
-| `hooks/stop-verify.sh` | A Stop hook. When the agent tries to finish in a registered repo with changed code, it runs that repo's checks. Fail or timeout → `exit 2`, the agent must keep working (max 3 blocks). Its own errors never trap the session. |
+| `hooks/stop-verify.sh` | A Stop hook. When the agent tries to finish in a registered repo with changed code, it runs that repo's checks. Fail or timeout → `exit 2`, the agent must keep working (max 3 blocks). With `tests_re` set, it also blocks a change that edits code and existing tests together. Its own errors never trap the session. |
 | `tools/codex-dispatch.sh` | Runs `codex exec` with an allowlist of flags only: read-only or workspace-write, network off by default, no user config (no MCP servers, no notify hooks), the report file only under `<repo>/.scratch/` or a temp folder. |
+| `tools/verify-evidence.sh` | Runs a check and prints a Markdown evidence block tied to the commit: SHA, command, exit code, log hash, and whether existing tests changed. Refuses a dirty tree. |
 | `docs/METHOD.md` | The method in one page. |
 
 ## Install

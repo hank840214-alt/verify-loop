@@ -14,6 +14,8 @@
 #   verify     bash command run at the repo root; $VERIFY_CHANGED holds the changed files, one per line
 #   requires   path that must exist first (e.g. node_modules), optional
 #   limit      seconds before the run counts as failed (default 480)
+#   tests_re   optional: existing files matching it may not be modified or deleted in the
+#              same change as other code (the fixer may not grade itself)
 #
 # One deadline for the whole hook (DEADLINE s, below the 600 s hook timeout), so
 # the hook can never run past its timeout and fail open.
@@ -99,6 +101,27 @@ verify_root() {
     rm -f "$COUNT_FILE"; printf '%s' "$FPRINT" > "$STATE_DIR/$ID.red"
     printf '{"systemMessage":"[stop-verify] %s still fails after %s tries. Claude stopped anyway; checks are red. This exact state will not be re-checked."}\n' "$KEY" "$MAX_BLOCKS"
     return 0
+  fi
+
+  # Test guard: the change that fixes code may not also edit the existing tests that judge it.
+  local TESTS_RE TAMPER
+  TESTS_RE="$(field "$KEY" tests_re)"
+  if [[ -n "$TESTS_RE" ]]; then
+    TAMPER="$( { git -c core.quotePath=false diff --name-status HEAD 2>/dev/null
+      [[ -n "$BASE" ]] && git -c core.quotePath=false diff --name-status "$BASE"...HEAD 2>/dev/null; } \
+      | awk -F'\t' '$1 ~ /^(M|D|R)/ {print $2}' | grep -E "$TESTS_RE" | sort -u )"
+    if [[ -n "$TAMPER" ]] && printf '%s\n' "$CHANGED" | grep -vqE "$TESTS_RE"; then
+      if [[ "${STOP_VERIFY_DRY:-0}" == 1 ]]; then echo "[dry] $KEY: test guard would block: $(printf '%s ' $TAMPER)" >&2; return 0; fi
+      echo $((BLOCKS + 1)) > "$COUNT_FILE"
+      {
+        echo "[stop-verify] $KEY: test guard (try $((BLOCKS + 1))/$MAX_BLOCKS). This change edits code AND existing tests that judge it:"
+        printf '  %s\n' $TAMPER
+        echo "The agent that writes a fix may not change the tests it is graded by. Revert the edits to those tests."
+        echo "If a test is really wrong, stop and say so: the test change goes in its own change, written or approved by someone else (a different agent or the user)."
+        echo "New test files are fine."
+      } >&2
+      return 2
+    fi
   fi
 
   if [[ "${STOP_VERIFY_DRY:-0}" == 1 ]]; then

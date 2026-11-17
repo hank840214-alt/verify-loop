@@ -3,12 +3,14 @@
     "code_re": "^((src|server|tests)/.*\\.(ts|tsx|js|mjs|css|html|json)|package\\.json)$",
     "verify": "npx tsc --noEmit && npm test --silent",
     "requires": "node_modules",
-    "limit": 300
+    "limit": 300,
+    "tests_re": "^tests/|\\.test\\.(ts|tsx|js|mjs)$"
   },
   "your-name/my-db-app": {
     "code_re": "^((src|tests|prisma)/.*\\.(ts|tsx|sql|prisma)|package\\.json)$",
     "verify": "T=$(mktemp -d) && trap 'rm -rf \"$T\"' EXIT && export DATABASE_URL=\"file:$T/test.db\" && case \"$DATABASE_URL\" in *dev.db*|*prod*) exit 99;; esac && npx prisma migrate deploy && npx jest --runInBand",
     "requires": "node_modules",
-    "limit": 300
+    "limit": 300,
+    "tests_re": "^tests/|\\.test\\.(ts|tsx|js|mjs)$"
   }
 }

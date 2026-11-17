@@ -72,6 +72,32 @@ printf '{"cwd":"%s","session_id":"a"}' "$A" | bash "$H" >"$T/out" 2>&1; [[ $? ==
 echo c > "$P/src/b c.ts"
 conf 'n=$(printf \"%s\\n\" \"$VERIFY_CHANGED\" | grep -c .); [ $n -eq 2 ] && printf \"%s\" \"$VERIFY_CHANGED\" | grep -qx \"src/b c.ts\"'
 expect_rc 0 "hook: VERIFY_CHANGED is one file per line" run_hook
+# test guard
+G="$T/guard"; mkdir -p "$G/src" "$G/tests"; git -C "$G" init -q; git -C "$G" remote add origin https://example.com/acme/guarded.git
+echo a > "$G/src/a.ts"; echo t > "$G/tests/a.test.ts"; git -C "$G" add -A; git -C "$G" -c user.email=t@t -c user.name=t commit -qm init
+printf '{"acme/guarded":{"code_re":"^(src|tests)/.*\\\\.ts$","tests_re":"^tests/","verify":"true","limit":120}}' > "$HOME/.claude/stop-verify.projects.json"; rm -rf "$HOME/.claude/state"
+ginput() { printf '{"cwd":"%s","session_id":"%s"}' "$G" "$1" | bash "$H"; }
+echo b >> "$G/src/a.ts"; echo weaker > "$G/tests/a.test.ts"
+expect_rc 2 "guard: fix + edited existing test -> blocked" ginput g1
+grep -q 'test guard' "$T/out" && ok "guard: says why" || bad "guard: message"
+git -C "$G" checkout -q tests/a.test.ts; echo n > "$G/tests/new.test.ts"
+expect_rc 0 "guard: fix + NEW test file -> allowed" ginput g2
+git -C "$G" checkout -q src/a.ts; rm "$G/tests/new.test.ts"; echo weaker > "$G/tests/a.test.ts"
+expect_rc 0 "guard: test-only change -> allowed" ginput g3
+git -C "$G" checkout -q tests/a.test.ts
+
+# evidence
+E="$ROOT/tools/verify-evidence.sh"
+in_g() { (cd "$G" && bash "$E" "$@"); }
+echo dirty >> "$G/src/a.ts"
+expect_rc 64 "evidence: dirty tree refused" in_g -- true
+git -C "$G" checkout -q src/a.ts
+printf '.scratch/\n' > "$G/.gitignore"; git -C "$G" add .gitignore; git -C "$G" -c user.email=t@t -c user.name=t commit -qm ignore
+expect_rc 0 "evidence: passing command" in_g -- true
+grep -q "$(git -C "$G" rev-parse HEAD)" "$T/out" && grep -q 'sha256' "$T/out" && ok "evidence: names the commit and log hash" || bad "evidence: block shape"
+expect_rc 1 "evidence: failing command keeps exit code" in_g -- false
+grep -q FAIL "$T/out" && ok "evidence: says FAIL" || bad "evidence: FAIL label"
+
 printf 'not json' > "$HOME/.claude/stop-verify.projects.json"
 expect_rc 0 "hook: broken config never traps the session" run_hook
 
