@@ -43,7 +43,7 @@ Hooks: a failed check must `exit 2` (exit 1 counts as done). A hook timeout mean
 - **Evidence rule**: every "done" or "passes" comes with the command and its output, or an artifact path. No evidence means not done.
 - **Whoever writes the fix does not grade it.** One agent writing both the fix and its test is marking its own exam.
   - The failing test is written by a different agent from the one that writes the fix, and committed first on its own.
-  - A change that fixes code may not edit the existing tests that judge it. The Stop hook's test guard blocks it (code and existing tests changed together → exit 2); new test files are fine. If a test is really wrong, that is a separate test-only change, approved by another agent or a human.
+  - A change that fixes code may not edit the existing tests that judge it. The Stop hook's test guard blocks it (uncommitted code and existing-test edits together → exit 2; committed ones are listed by the evidence script for the reviewer); new test files are fine. If a test is really wrong, that is a separate test-only change, approved by another agent or a human.
   - Evidence is tied to a commit: the PR's verification section comes from `tools/verify-evidence.sh` (commit SHA, command, exit code, log hash, whether existing tests changed), not from the agent's own words. Reviewers check that the SHA is the PR head.
   - Merging needs a human or an independent reviewer to approve that same SHA. The local guard stops mistakes, not deliberate bypasses; hard enforcement needs CI plus branch protection.
 - Four layers replace a code reviewer: tests plus CI, a fresh-context review by a strong model, a review by a different model family, and formal verification for account and state flows.

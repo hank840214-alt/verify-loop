@@ -107,10 +107,11 @@ verify_root() {
   local TESTS_RE TAMPER
   TESTS_RE="$(field "$KEY" tests_re)"
   if [[ -n "$TESTS_RE" ]]; then
-    TAMPER="$( { git -c core.quotePath=false diff --name-status HEAD 2>/dev/null
-      [[ -n "$BASE" ]] && git -c core.quotePath=false diff --name-status "$BASE"...HEAD 2>/dev/null; } \
+    # Uncommitted edits only: old unpushed history is not this session's fix.
+    # Committed test edits are listed by verify-evidence.sh for the PR reviewer.
+    TAMPER="$( git -c core.quotePath=false diff --name-status HEAD 2>/dev/null \
       | awk -F'\t' '$1 ~ /^(M|D|R)/ {print $2}' | grep -E "$TESTS_RE" | sort -u )"
-    if [[ -n "$TAMPER" ]] && printf '%s\n' "$CHANGED" | grep -vqE "$TESTS_RE"; then
+    if [[ -n "$TAMPER" ]] && git -c core.quotePath=false diff --name-only HEAD 2>/dev/null | grep -E "$(field "$KEY" code_re)" | grep -vqE "$TESTS_RE"; then
       if [[ "${STOP_VERIFY_DRY:-0}" == 1 ]]; then echo "[dry] $KEY: test guard would block: $(printf '%s ' $TAMPER)" >&2; return 0; fi
       echo $((BLOCKS + 1)) > "$COUNT_FILE"
       {
