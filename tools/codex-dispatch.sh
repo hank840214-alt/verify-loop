@@ -72,7 +72,8 @@ else
 fi
 protected=()
 selfrepo="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null || true)"
-for p in "$selfrepo" "$home/.claude" "$home/.codex"; do
+selfdir="$(real "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null || true)"
+for p in "$selfrepo" "$selfdir" "$home/.claude" "$home/.codex"; do
   [[ -n "$p" ]] || continue; rp="$(real "$p" 2>/dev/null)" || continue; protected+=("$rp")
 done
 inside_protected() { local x="$1" p; for p in ${protected[@]+"${protected[@]}"}; do [[ "$x" == "$p" || "$x" == "$p"/* ]] && return 0; done; return 1; }

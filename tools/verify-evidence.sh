@@ -8,6 +8,7 @@
 #
 # Usage (from inside the repo):
 #   verify-evidence.sh [--tests-re <regex>] [--base <ref>] [--log-dir <dir>] -- <command> [args...]
+#   verify-evidence.sh ... -- 'npx tsc --noEmit && npm test'   # one quoted string runs in bash -c
 # Exit: the command's exit code; 3 if the evidence is invalid (tree or HEAD changed
 # during the run); 64 for usage errors or a dirty tree.
 set -uo pipefail
@@ -44,7 +45,7 @@ mkdir -p "$logdir" || die "cannot create $logdir"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 log="$(mktemp "$logdir/${sha:0:12}-$stamp.XXXXXX")" || die "mktemp failed"
 start=$SECONDS
-"$@" >"$log" 2>&1; rc=$?
+if (($# == 1)); then bash -c "$1" >"$log" 2>&1; rc=$?; else "$@" >"$log" 2>&1; rc=$?; fi
 secs=$((SECONDS - start))
 hash="$(sha256 "$log")"; [[ ${#hash} == 64 ]] || die "could not hash the log" 3
 valid=1
@@ -60,19 +61,21 @@ echo "- Ran at (UTC): $stamp, ${secs}s"
 echo "- Full log: \`$log\` (sha256 \`$hash\`)"
 ((valid)) || echo "- **INVALID**: the tree or HEAD changed while the command ran. Do not use this evidence."
 if [[ -n "$tests_re" ]]; then
-  if [[ -z "$base" ]] || ! mb="$(git merge-base "$base" HEAD 2>/dev/null)"; then
+  if [[ -z "$base" ]] || ! git rev-parse -q --verify "$base^{commit}" >/dev/null || ! mb="$(git merge-base "$base" HEAD 2>/dev/null)"; then
     echo "- Existing tests changed: **UNKNOWN** (no valid base; pass --base)"
   elif ! ns="$(git -c core.quotePath=false diff --name-status "$mb" HEAD)"; then
     echo "- Existing tests changed: **UNKNOWN** (diff failed)"
   else
-    touched="$(printf '%s\n' "$ns" | awk -F'\t' '$1 ~ /^(M|D|R|T)/ {print $2}' | grep -E "$tests_re" || true)"
+    # Net change vs base, plus any commit in the branch that modified a test file
+    # (catches "add a test, then weaken it" inside the same PR).
+    touched="$( { printf '%s\n' "$ns"; git -c core.quotePath=false log --format= --name-status "$mb"..HEAD; } \
+      | awk -F'\t' '$1 ~ /^(M|D|R|T)/ {print $2}' | grep -E -- "$tests_re" | sort -u || true)"
     if [[ -n "$touched" ]]; then
       echo "- Existing tests changed vs \`$base\` (need an independent reviewer):"
       printf '%s\n' "$touched" | sed 's/^/  - `/; s/$/`/'
     else
       echo "- Existing tests changed vs \`$base\`: none"
     fi
-    echo "  (A test added and later weakened inside this PR shows as added. Compare against the independent test commit with --base <that commit>.)"
   fi
 fi
 echo

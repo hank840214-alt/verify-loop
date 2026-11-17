@@ -34,7 +34,10 @@ STATE_DIR="$HOME/.claude/state/stop-verify"
 note() { printf '{"systemMessage":"[stop-verify] %s"}\n' "$1"; exit 0; }
 [[ -f "$CONF" ]] || exit 0
 command -v jq >/dev/null 2>&1 || note "jq missing; verification skipped"
-command -v shasum >/dev/null 2>&1 || note "shasum missing; verification skipped"
+if command -v shasum >/dev/null 2>&1; then HASH=shasum
+elif command -v sha1sum >/dev/null 2>&1; then HASH=sha1sum
+else note "shasum/sha1sum missing; verification skipped"; fi
+hsum() { "$HASH" -- "$@"; }
 jq -e . "$CONF" >/dev/null 2>&1 || note "projects.json is not valid JSON; verification skipped"
 
 INPUT="$(cat)"
@@ -47,7 +50,7 @@ export NPM_CONFIG_UPDATE_NOTIFIER=false
 project_of() {  # repo root -> project key, or empty
   local url name
   url="$(git -C "$1" remote get-url origin 2>/dev/null)" || return 0
-  name="${url%.git}"; name="${name%/}"; name="${name##*:}"   # git@host:owner/repo -> owner/repo
+  name="${url%/}"; name="${name%.git}"; name="${name%/}"; name="${name##*:}"   # git@host:owner/repo -> owner/repo
   name="$(printf '%s' "$name" | awk -F/ 'NF>=2{print $(NF-1)"/"$NF}')"
   [[ -n "$name" ]] || return 0
   jq -e --arg k "$name" 'has($k)' "$CONF" >/dev/null 2>&1 && printf '%s' "$name"
@@ -93,22 +96,23 @@ verify_root() {
 
   mkdir -p "$STATE_DIR" || return 0
   local ID PASS_FILE COUNT_FILE FPRINT BLOCKS
-  ID="$(printf '%s' "$ROOT" | shasum | cut -c1-16)"
+  ID="$(printf '%s' "$ROOT" | hsum | cut -c1-16)"
   PASS_FILE="$STATE_DIR/$ID.pass"; COUNT_FILE="$STATE_DIR/$ID.$SESSION.blocks"
   FPRINT="$( { git rev-parse HEAD 2>/dev/null; printf '%s\n' "$VERIFY";
     printf '%s\n' "$CHANGED" | while IFS= read -r f; do [[ -f "$f" ]] || printf '%s deleted\n' "$f"; done;
-    printf '%s\n' "$CHANGED" | while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\0' "$f"; done | xargs -0 shasum 2>/dev/null;
-  } | shasum | cut -c1-40)"
+    printf '%s\n' "$CHANGED" | while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\0' "$f"; done | xargs -0 "$HASH" -- 2>/dev/null;
+  } | hsum | cut -c1-40)"
   [[ ${#FPRINT} == 40 ]] || { printf '{"systemMessage":"[stop-verify] could not fingerprint changes; checks skipped"}\n'; return 0; }
   [[ -f "$PASS_FILE" && "$(cat "$PASS_FILE")" == "$FPRINT" ]] && return 0
   [[ -f "$STATE_DIR/$ID.red" && "$(cat "$STATE_DIR/$ID.red")" == "$FPRINT" ]] && return 0
 
   BLOCKS="$(cat "$COUNT_FILE" 2>/dev/null || echo 0)"
-  if (( BLOCKS >= MAX_BLOCKS )); then
+  # Checks always run; only after they fail again past MAX_BLOCKS may Claude stop (red).
+  give_up() {
     rm -f "$COUNT_FILE"; printf '%s' "$FPRINT" > "$STATE_DIR/$ID.red"
-    printf '{"systemMessage":"[stop-verify] %s still fails after %s tries. Claude stopped anyway; checks are red. This exact state will not be re-checked."}\n' "$KEY" "$MAX_BLOCKS"
+    printf '{"systemMessage":"[stop-verify] %s still fails after %s tries (%s). Claude stopped anyway; checks are RED. This exact state will not be re-checked."}\n' "$KEY" "$MAX_BLOCKS" "$1"
     return 0
-  fi
+  }
 
   # Test guard: the change that fixes code may not also edit the existing tests that judge it.
   local TESTS_RE TAMPER
@@ -117,15 +121,16 @@ verify_root() {
     # Uncommitted edits only: old unpushed history is not this session's fix.
     # Committed test edits are listed by verify-evidence.sh for the PR reviewer.
     TAMPER="$( git -c core.quotePath=false diff --name-status HEAD 2>/dev/null \
-      | awk -F'\t' '$1 ~ /^(M|D|R|T)/ {print $2}' | grep -E "$TESTS_RE" | sort -u )"
+      | awk -F'\t' '$1 ~ /^(M|D|R|T)/ {print $2}' | grep -E -- "$TESTS_RE" | sort -u )"
     if [[ -n "$TAMPER" ]] && { git -c core.quotePath=false diff --name-only HEAD 2>/dev/null
          git -c core.quotePath=false ls-files --others --exclude-standard 2>/dev/null; } \
-         | grep -E "$CODE_RE" | grep -vqE "$TESTS_RE"; then
-      if [[ "${STOP_VERIFY_DRY:-0}" == 1 ]]; then echo "[dry] $KEY: test guard would block: $(printf '%s ' $TAMPER)" >&2; return 0; fi
+         | grep -E -- "$CODE_RE" | grep -vqE -- "$TESTS_RE"; then
+      if [[ "${STOP_VERIFY_DRY:-0}" == 1 ]]; then echo "[dry] $KEY: test guard would block: $(printf '%s' "$TAMPER" | tr '\n' ' ')" >&2; return 0; fi
+      (( BLOCKS >= MAX_BLOCKS )) && { give_up "test guard"; return 0; }
       echo $((BLOCKS + 1)) > "$COUNT_FILE"
       {
         echo "[stop-verify] $KEY: test guard (try $((BLOCKS + 1))/$MAX_BLOCKS). This change edits code AND existing tests that judge it:"
-        printf '  %s\n' $TAMPER
+        printf '%s\n' "$TAMPER" | sed 's/^/  /' 
         echo "The agent that writes a fix may not change the tests it is graded by. Revert the edits to those tests."
         echo "If a test is really wrong, stop and say so: the test change goes in its own change, written or approved by someone else (a different agent or the user)."
         echo "New test files are fine."
@@ -143,7 +148,7 @@ verify_root() {
   LOG="$(mktemp "${TMPDIR:-/tmp}/stop-verify.XXXXXX")" || note "mktemp failed; verification skipped"
   LEFT=$((DEADLINE - SECONDS)); (( LEFT < LIMIT )) && LIMIT=$LEFT
   START=$SECONDS
-  if (( LIMIT < 60 )); then
+  if (( LEFT < 60 )); then
     RC=124; echo "not enough time left in this stop to run checks" >"$LOG"
   else
     VERIFY_CHANGED="$CHANGED" run_limited "$LIMIT" bash -c "$VERIFY" >"$LOG" 2>&1
@@ -154,6 +159,7 @@ verify_root() {
     printf '%s' "$FPRINT" > "$PASS_FILE"; rm -f "$COUNT_FILE" "$LOG" "$STATE_DIR/$ID.red"; return 0
   fi
 
+  (( BLOCKS >= MAX_BLOCKS )) && { rm -f "$LOG"; give_up "rc=$RC"; return 0; }
   echo $((BLOCKS + 1)) > "$COUNT_FILE"
   {
     if (( RC == 124 )); then

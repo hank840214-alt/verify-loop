@@ -73,10 +73,11 @@ conf "exit 1"; expect_rc 2 "hook: failing checks -> exit 2"   run_hook
 conf "exit 1"; expect_rc 2 "hook: block 1"                    run_hook s2
                expect_rc 2 "hook: block 2"                    run_hook s2
                expect_rc 2 "hook: block 3"                    run_hook s2
-               expect_rc 0 "hook: gives up after 3 blocks"    run_hook s2
+               expect_rc 0 "hook: 4th try still runs checks, then gives up red" run_hook s2
 grep -q 'still fails' "$T/out" && ok "hook: says checks are red" || bad "hook: red message"
                expect_rc 0 "hook: same red state not re-blocked" run_hook s3
-conf "true" 5; expect_rc 2 "hook: limit under 60s counts as timeout failure" run_hook
+conf "sleep 5" 1; expect_rc 2 "hook: hitting the limit counts as a failure" run_hook
+grep -q 'limit' "$T/out" && ok "hook: says it hit the limit" || bad "hook: timeout message"
 conf "true" "\"abc\""; expect_rc 0 "hook: non-numeric limit is rejected, not run" run_hook
 grep -q 'limit must be' "$T/out" && ok "hook: says the limit is invalid" || bad "hook: limit message"
 C2="$T/clone2"; git clone -q "$P" "$C2"; git -C "$C2" remote set-url origin https://example.com/acme/my-web-app.git; echo z >> "$C2/src/a.ts"
@@ -120,6 +121,14 @@ grep -q "$(git -C "$G" rev-parse HEAD)" "$T/out" && [[ -f "$LOGF" && "$(shasum -
 expect_rc 3 "evidence: tree changed during run -> exit 3 INVALID" in_g -- touch src/during.ts
 grep -q INVALID "$T/out" && ok "evidence: says INVALID" || bad "evidence: INVALID label"
 rm -f "$G/src/during.ts"
+expect_rc 0 "evidence: one quoted string runs as a shell command" in_g -- 'true && echo compound-ok'
+grep -q compound-ok "$T/out" && ok "evidence: compound command ran fully" || bad "evidence: compound"
+echo t2 > "$G/tests/b.test.ts"; git -C "$G" add -A; git -C "$G" -c user.email=t@t -c user.name=t commit -qm "add test"
+echo weaker > "$G/tests/b.test.ts"; git -C "$G" -c user.email=t@t -c user.name=t commit -qam "weaken test"
+expect_rc 0 "evidence: run with base" in_g --tests-re '^tests/' --base "$(git -C "$G" rev-list --max-parents=0 HEAD)" -- true
+grep -q 'tests/b.test.ts' "$T/out" && ok "evidence: add-then-weaken inside the branch is reported" || bad "evidence: missed weakened test"
+expect_rc 0 "evidence: bad base" in_g --tests-re '^tests/' --base no-such-ref -- true
+grep -q UNKNOWN "$T/out" && ok "evidence: bad base reports UNKNOWN" || bad "evidence: bad base"
 expect_rc 1 "evidence: failing command keeps exit code" in_g -- false
 grep -q FAIL "$T/out" && ok "evidence: says FAIL" || bad "evidence: FAIL label"
 
