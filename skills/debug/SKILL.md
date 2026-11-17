@@ -16,14 +16,15 @@ Decide the route, state the reason in one line, do not ask.
 
 ## Ordinary debugging
 1. Restate the symptom in one line. Pin the target: repo, HEAD, uncommitted files.
-2. Reproduce on the real code with the smallest script or test; print one decisive line. Cannot reproduce → report what you tried. Do not guess-fix.
+2. Write down the correct end state and the broken one. Reproduce on the real code with the smallest script or test, from a clean start; see the broken state twice, resetting in between. Never inject data or state to "create" the bug. Not seen twice → the verdict is "inconclusive", not "fixed"; do not guess-fix.
+   - Ask: can this state happen in normal use? Yes → fix the data flow. No → reject it at the entry point. Fix the pattern, not one spot.
 3. Find the cause (file:line). Write the failing test first, then the smallest fix, then watch the test pass. If another session has uncommitted work in the same files, fix in an isolated copy and apply a patch.
 4. Run the blast radius.
 5. Same kind of bug a second time → `verify-loop` triage, to turn it into a check.
 6. Hand over through `verify-loop` done.
 
 ## Blast radius
-1. List callers and shared data the change touches (search for real; cite file:line).
+1. List callers and shared data the change touches (search for real; cite file:line). Also list what search cannot find: pinned library versions, API JSON fields, database columns, wire formats, feature flags, and already-released app builds reading the same data. End with two lists: cleared (with reason) | confirmed safe (with output).
 2. Write the one fact: "this is safe because ___".
 3. Prove that fact by running real code (command + output). Cannot prove it → list it as a risk; do not call it safe.
 

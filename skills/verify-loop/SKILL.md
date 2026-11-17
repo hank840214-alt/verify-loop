@@ -16,7 +16,7 @@ Pick the mode from the conversation without asking: a multi-step task is startin
 1. Write 3–5 pass/fail checkpoints in feature-map words ("a new user sees the welcome screen within one second"), not implementation.
 2. The user confirms or edits the list before work starts.
 3. Turn each checkpoint into a failing test or verification step first, then write the code. A different agent from the fixer writes the test and commits it first; the fixer may not edit it. Tick each with evidence.
-4. For long, overnight or unattended runs, keep `.scratch/decisions.tsv`: time | phase | decision | why | evidence | result. End with a "needs your attention" section.
+4. For long, overnight or unattended runs, keep `.scratch/decisions.tsv`: time | phase | decision | why | evidence | result. Append only. At the end, a **different** agent audits each row's evidence and writes the "needs your attention" section; the session that did the work does not write it.
 
 ## setup — audit a repo's guardrails
 1. Read `AGENTS.md`/`CLAUDE.md`, the package manifest, CI workflows, `.claude/settings*.json`.
@@ -34,18 +34,18 @@ Pick the mode from the conversation without asking: a multi-step task is startin
 
 ## map — feature map plus a driver for the real app
 1. `plans/FEATURE-MAP.md`, one row per feature: fixed name (the user's word) | how to reach it from launch | what proves it works | the verify command.
-2. One CLI in the repo (e.g. `tools/drive.mjs`) with at least `open <feature>`, `click --name <accessible name>`, `snapshot` (text view of the screen), `screenshot <file>`. Reuse existing QA scripts: pull the repeated launch/login steps into the driver and make old scripts call it.
+2. One CLI in the repo (e.g. `tools/drive.mjs`; include a `doctor` command that confirms the running build is this commit and the services are up; screenshots must show which app and version; cleanup never deletes evidence) with at least `open <feature>`, `click --name <accessible name>`, `snapshot` (text view of the screen), `screenshot <file>`. Reuse existing QA scripts: pull the repeated launch/login steps into the driver and make old scripts call it.
 3. Each feature gets at least one driver flow that saves a screenshot as evidence.
 4. Refresh monthly, or when a mapped feature changes: walk every row for real. A row that fails gets a fixed map or a bug ticket, at most one PR per pass.
 
 ## triage — where a mistake or requirement belongs
-Answer the five questions in `${CLAUDE_PLUGIN_ROOT}/docs/METHOD.md` §1 in order, one line of reasoning each. For "a machine can tell", walk the correction tree (redesign → type → lint with the fix in its message → test → app-driving step) and stop at the first rung that works. Prove the check fails on the real past mistake and passes without it; attach both outputs. State/timing bugs → a TLA+ model locked in as a repo check, with a statechart. Pure invariants → consider Lean. List any old text rule this replaces as "can delete", for the user to approve.
+Answer the five questions in `${CLAUDE_PLUGIN_ROOT}/docs/METHOD.md` §1 in order, one line of reasoning each. For "a machine can tell", walk the correction tree (redesign → type → lint with the fix in its message → test → app-driving step) and stop at the first rung that works. Lint exceptions need a reason, an expiry date and an approver. Tests check behaviour: they should survive a refactor of the internals. Prove the check fails on the real past mistake and passes without it; attach both outputs. State/timing bugs → a TLA+ model locked in as a repo check, with a statechart. Pure invariants → consider Lean. List any old text rule this replaces as "can delete", for the user to approve.
 
 ## done — before handing over
 1. Commit, then run the checks through `${CLAUDE_PLUGIN_ROOT}/tools/verify-evidence.sh --tests-re '<test paths>' -- <verify command>`. Paste its output unchanged into the PR's Verification section; never write that section by hand. Red means not done. If it lists changed existing tests, another agent or the user must approve that part.
 2. Produce artifacts: UI change → before/after screenshots or a short video; flow/state change → a statechart (rerun the model if one exists); bug fix → failing repro before, passing after. Name things by the feature map.
 3. Blast radius, even for small changes: list callers and shared data (file:line), write "this is safe because ___", prove that one fact by running real code.
 4. PR body, in order: Why | What changed | Scope | Tradeoffs | Blast radius | Verification (commands + output). Conventional Commits title. Never merge from here.
-5. Reviewers first check that the evidence SHA equals the PR head; if not, rerun. Merge only after the user or an independent reviewer approves that SHA. Review by risk tier, never by the session that wrote the code: docs → green checks; normal → one fresh reviewer (strong model or Codex read-only via the dispatch script); money/login/store/data deletion → both, plus a rollback or flag.
-6. Fix P1/P2 findings before handing over. Append each finding to `plans/FINDINGS.md`: date | kind | one sentence | already has a check?
+5. For UI or flow changes, a non-author agent drives the app like a user on the old and new build and gives a pass/fail verdict with screenshots; green CI and code review are not that verdict. Reviewers first check that the evidence SHA equals the PR head; if not, rerun. Merge only after the user or an independent reviewer approves that SHA. Review by risk tier, never by the session that wrote the code: docs → green checks; normal → one fresh reviewer (strong model or Codex read-only via the dispatch script); money/login/store/data deletion → both, plus a rollback or flag.
+6. Each review finding gets one of: fix, dismiss with a concrete disproof, or ask the user. Never dismiss findings about auth, billing, data, migrations or concurrency. Settle P1/P2 before handing over. Append each finding to `plans/FINDINGS.md`: date | kind | one sentence | already has a check?
 7. A kind of finding seen a second time → run triage and propose the check.
