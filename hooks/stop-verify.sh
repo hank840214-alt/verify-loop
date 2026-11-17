@@ -14,6 +14,8 @@
 #   verify     bash command run at the repo root; $VERIFY_CHANGED holds the changed files, one per line
 #   requires   path that must exist first (e.g. node_modules), optional
 #   limit      seconds before the run counts as failed (default 480)
+#   roots      REQUIRED: absolute paths of the checkouts you trust, e.g. ["/home/me/src/shop"].
+#              Another clone with the same owner/repo is never run.
 #   tests_re   optional: existing files matching it may not be modified or deleted in the
 #              same change as other code (the fixer may not grade itself)
 #
@@ -68,6 +70,11 @@ verify_root() {
   CODE_RE="$(field "$KEY" code_re)"; VERIFY="$(field "$KEY" verify)"
   REQ="$(field "$KEY" requires)"; LIMIT="$(field "$KEY" limit)"; LIMIT="${LIMIT:-480}"
   [[ -n "$CODE_RE" && -n "$VERIFY" ]] || return 0
+  [[ "$LIMIT" =~ ^[0-9]+$ ]] && (( LIMIT >= 1 && LIMIT <= 3600 )) || { printf '{"systemMessage":"[stop-verify] %s: limit must be 1-3600 seconds; checks skipped"}\n' "$KEY"; return 0; }
+  local re; for re in "$CODE_RE" "$(field "$KEY" tests_re)"; do
+    [[ -z "$re" ]] && continue
+    printf '' | grep -E "$re" >/dev/null 2>&1; [[ $? -le 1 ]] || { printf '{"systemMessage":"[stop-verify] %s: invalid regex in config; checks skipped"}\n' "$KEY"; return 0; }
+  done
   if [[ -n "$REQ" && ! -e "$ROOT/$REQ" ]]; then
     printf '{"systemMessage":"[stop-verify] %s: %s is missing, checks skipped"}\n' "$KEY" "$REQ"; return 0
   fi
@@ -110,8 +117,10 @@ verify_root() {
     # Uncommitted edits only: old unpushed history is not this session's fix.
     # Committed test edits are listed by verify-evidence.sh for the PR reviewer.
     TAMPER="$( git -c core.quotePath=false diff --name-status HEAD 2>/dev/null \
-      | awk -F'\t' '$1 ~ /^(M|D|R)/ {print $2}' | grep -E "$TESTS_RE" | sort -u )"
-    if [[ -n "$TAMPER" ]] && git -c core.quotePath=false diff --name-only HEAD 2>/dev/null | grep -E "$(field "$KEY" code_re)" | grep -vqE "$TESTS_RE"; then
+      | awk -F'\t' '$1 ~ /^(M|D|R|T)/ {print $2}' | grep -E "$TESTS_RE" | sort -u )"
+    if [[ -n "$TAMPER" ]] && { git -c core.quotePath=false diff --name-only HEAD 2>/dev/null
+         git -c core.quotePath=false ls-files --others --exclude-standard 2>/dev/null; } \
+         | grep -E "$CODE_RE" | grep -vqE "$TESTS_RE"; then
       if [[ "${STOP_VERIFY_DRY:-0}" == 1 ]]; then echo "[dry] $KEY: test guard would block: $(printf '%s ' $TAMPER)" >&2; return 0; fi
       echo $((BLOCKS + 1)) > "$COUNT_FILE"
       {
@@ -163,5 +172,10 @@ verify_root() {
 ROOT="$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null)" || exit 0
 KEY="$(project_of "$ROOT")"
 [[ -n "$KEY" ]] || exit 0
+# Only checkouts listed in "roots" are trusted; a same-named clone elsewhere is ignored.
+RROOT="$(cd "$ROOT" && pwd -P)"
+jq -e --arg k "$KEY" --arg r "$RROOT" '(.[$k].roots // []) | map(sub("/+$";"")) | index($r) != null' "$CONF" >/dev/null 2>&1 || {
+  jq -e --arg k "$KEY" '.[$k].roots' "$CONF" >/dev/null 2>&1 || printf '{"systemMessage":"[stop-verify] %s has no roots list; add this checkout path to roots to trust it"}\n' "$KEY"
+  exit 0; }
 verify_root "$ROOT" "$KEY"
 exit $?

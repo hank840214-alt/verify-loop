@@ -13,8 +13,8 @@ If you build software by talking to Claude Code, Codex or Gemini CLI, you cannot
 | `skills/verify-loop` | Say "verify". The model picks a mode: **start** (agree on 3–5 checkpoints first), **setup** (audit a repo's guardrails), **map** (feature map + a CLI that drives the real app), **triage** (turn a mistake into a check), **done** (evidence, blast radius, risk-tiered review). |
 | `skills/debug` | Say "debug". The model routes: ordinary bug, performance, state/timing, or blast radius. |
 | `hooks/stop-verify.sh` | A Stop hook. When the agent tries to finish in a registered repo with changed code, it runs that repo's checks. Fail or timeout → `exit 2`, the agent must keep working (max 3 blocks). With `tests_re` set, it also blocks a change that edits code and existing tests together. Its own errors never trap the session. |
-| `tools/codex-dispatch.sh` | Runs `codex exec` with an allowlist of flags only: read-only or workspace-write, network off by default, no user config (no MCP servers, no notify hooks), the report file only under `<repo>/.scratch/` or a temp folder. |
-| `tools/verify-evidence.sh` | Runs a check and prints a Markdown evidence block tied to the commit: SHA, command, exit code, log hash, and whether existing tests changed. Refuses a dirty tree. |
+| `tools/codex-dispatch.sh` | Runs `codex exec` with an allowlist of flags only: read-only or workspace-write, network off by default for the commands Codex runs (the prompt and images still go to the model service; the caller can pass `--net`), no user config (no MCP servers, no notify hooks), the report file only under `<repo>/.scratch/` or a temp folder. |
+| `tools/verify-evidence.sh` | Runs a check and prints a Markdown evidence block tied to the commit: SHA, command, exit code, log hash, and whether existing tests changed. Refuses a dirty tree; exits 3 if the tree changes during the run. Local evidence helps a reviewer; the real gate is CI rerunning on that SHA. |
 | `docs/METHOD.md` | The method in one page. |
 
 ## Install
@@ -27,11 +27,12 @@ If you build software by talking to Claude Code, Codex or Gemini CLI, you cannot
 The plugin registers the Stop hook. It does nothing until you register a project.
 
 ### Register a project for the Stop hook
-Copy `examples/stop-verify.projects.json` to `~/.claude/stop-verify.projects.json` and edit it. The key is `owner/repo` from your `origin` remote (for `git@github.com:alice/shop.git` it is `alice/shop`), so a different owner's clone with the same name never matches.
+Copy `examples/stop-verify.projects.json` to `~/.claude/stop-verify.projects.json` and edit it. The key is `owner/repo` from your `origin` remote (for `git@github.com:alice/shop.git` it is `alice/shop`), so a different owner's clone with the same name never matches. `roots` is required: the absolute paths of the checkouts you trust. Any other checkout, even of the same repo, is never run.
 
 ```json
 {
   "your-name/my-web-app": {
+    "roots": ["/home/you/src/my-web-app"],
     "code_re": "^((src|tests)/.*\\.(ts|tsx|css|json)|package\\.json)$",
     "verify": "npx tsc --noEmit && npm test --silent",
     "requires": "node_modules",

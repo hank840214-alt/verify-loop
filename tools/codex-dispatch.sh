@@ -19,9 +19,12 @@
 #   - Network is off unless --net (workspace-write only).
 #   - -C: needs a git toplevel unless read-only + --skip-git-repo-check; never $HOME or /.
 #   - -C and -o are refused inside this script's repo, ~/.claude and ~/.codex (any mode).
-#   - -o: a NEW .md/.txt file, not a symlink, under <-C>/.scratch/, /tmp, /private/tmp
-#     or $TMPDIR. Codex writes -o itself, outside its sandbox, so the target is narrow.
-#   - Note: read-only Codex can still READ any file your user can read.
+#   - -o: a NEW .md/.txt file, not a symlink, under <-C>/.scratch/ (itself not a symlink)
+#     or /tmp. Codex writes into a private temp folder; this script then creates -o
+#     exclusively, so a file swapped in meanwhile is never overwritten.
+#   - Note: read-only Codex can still READ any file your user can read, and the prompt
+#     file and -i images are sent to the model service. "Network off" applies to the
+#     commands Codex runs, not to the model call itself.
 #   - The work order goes in on stdin.
 #   - DRY_RUN=1 prints the command instead of running it.
 set -euo pipefail
@@ -72,7 +75,7 @@ selfrepo="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>
 for p in "$selfrepo" "$home/.claude" "$home/.codex"; do
   [[ -n "$p" ]] || continue; rp="$(real "$p" 2>/dev/null)" || continue; protected+=("$rp")
 done
-inside_protected() { local x="$1" p; for p in "${protected[@]}"; do [[ "$x" == "$p" || "$x" == "$p"/* ]] && return 0; done; return 1; }
+inside_protected() { local x="$1" p; for p in ${protected[@]+"${protected[@]}"}; do [[ "$x" == "$p" || "$x" == "$p"/* ]] && return 0; done; return 1; }
 inside_protected "$rdir" && die "-C cannot be inside this tool's repo, ~/.claude or ~/.codex"
 if ((net)) && [[ "$mode" != workspace-write ]]; then die "--net is only allowed with workspace-write"; fi
 
@@ -81,11 +84,12 @@ if [[ -n "$out" ]]; then
   odir="$(dirname "$out")"; [[ "$odir" = /* ]] || odir="$PWD/$odir"
   rodir="$(real "$odir")" || die "-o folder does not exist"
   ok=0
-  for base in "$rdir/.scratch" /tmp /private/tmp "${TMPDIR:-/nonexistent}"; do
+  [[ -L "$rdir/.scratch" ]] && die "<-C>/.scratch is a symlink; refusing"
+  for base in "$rdir/.scratch" /tmp /private/tmp; do
     b="$(real "$base" 2>/dev/null)" || continue
     [[ "$rodir" == "$b" || "$rodir" == "$b"/* ]] && ok=1
   done
-  ((ok)) || die "-o must be under <-C>/.scratch/, /tmp or \$TMPDIR"
+  ((ok)) || die "-o must be under <-C>/.scratch/ or /tmp"
   if [[ "$rodir" == "$rdir" || "$rodir" == "$rdir"/* ]]; then
     [[ "$rodir" == "$rdir/.scratch" || "$rodir" == "$rdir/.scratch"/* ]] || die "-o inside the -C repo must be under .scratch/"
   fi
@@ -106,10 +110,25 @@ final=(--ignore-user-config "${images[@]+"${images[@]}"}" -s "$mode" -C "$rdir")
 if ((net)); then final+=(-c sandbox_workspace_write.network_access=true); else final+=(-c sandbox_workspace_write.network_access=false); fi
 ((skip)) && final+=(--skip-git-repo-check)
 ((json)) && final+=(--json)
-[[ -n "$out" ]] && final+=(-o "$out")
+
+# Codex writes -o outside its sandbox, so it writes into a fresh private folder;
+# this script then creates the real file exclusively (noclobber), never following
+# a file that appeared in the meantime.
+if [[ -n "$out" ]]; then
+  stage="$(mktemp -d "${TMPDIR:-/tmp}/codex-dispatch.XXXXXX")" || die "mktemp failed" 70
+  chmod 700 "$stage"; trap 'rm -rf "$stage"' EXIT
+  final+=(-o "$stage/last-message.md")
+fi
 
 if [[ "${DRY_RUN:-0}" == 1 ]]; then
   printf 'codex exec'; printf ' %q' "${final[@]}"; printf ' - < %q\n' "$prompt_file"
+  [[ -n "$out" ]] && printf 'then copy to %q (exclusive create)\n' "$out"
   exit 0
 fi
-exec codex exec "${final[@]}" - < "$prompt_file"
+[[ -n "$out" ]] || exec codex exec "${final[@]}" - < "$prompt_file"
+codex exec "${final[@]}" - < "$prompt_file"; rc=$?
+if [[ -f "$stage/last-message.md" ]]; then
+  [[ -L "$out" || -e "$out" ]] && die "-o target appeared while Codex ran; report left unsaved" 73
+  ( set -C; cat "$stage/last-message.md" > "$out" ) || die "could not create $out" 73
+fi
+exit "$rc"

@@ -40,13 +40,25 @@ grep -q -- '--ignore-user-config' "$T/out" && grep -q 'network_access=false' "$T
 bash "$D" -f "$T/task.md" -s workspace-write -C "$REPO" --net >"$T/out" 2>&1
 grep -q 'network_access=true' "$T/out" && ok "dispatch: --net turns network on explicitly" || bad "dispatch: --net"
 unset DRY_RUN
+mkdir -p "$T/bin"; cat > "$T/bin/codex" <<'FAKE'
+#!/usr/bin/env bash
+o=""; while (($#)); do [[ "$1" == -o ]] && o="$2"; shift; done
+cat >/dev/null; [[ -n "$o" ]] && echo "fake report" > "$o"; exit 0
+FAKE
+chmod +x "$T/bin/codex"
+PATH="$T/bin:$PATH" expect_rc 0 "dispatch: real run delivers -o via private staging" bash "$D" -f "$T/task.md" -s read-only -C "$REPO" -o "$REPO/.scratch/real.md"
+grep -q "fake report" "$REPO/.scratch/real.md" && ok "dispatch: report delivered" || bad "dispatch: report missing"
+mkdir -p "$T/outside"; mv "$REPO/.scratch" "$T/outside/s"; ln -s "$T/outside/s" "$REPO/.scratch"
+expect_rc 65 "dispatch: .scratch symlink refused" bash "$D" -f "$T/task.md" -s read-only -C "$REPO" -o "$REPO/.scratch/x.md"
+rm "$REPO/.scratch"; mv "$T/outside/s" "$REPO/.scratch"
 
 # ---------- stop-verify ----------
 H="$ROOT/hooks/stop-verify.sh"
 P="$T/proj"; mkdir -p "$P/src"; git -C "$P" init -q; git -C "$P" remote add origin https://example.com/acme/my-web-app.git
 echo a > "$P/src/a.ts"; echo r > "$P/README.md"; git -C "$P" add -A; git -C "$P" -c user.email=t@t -c user.name=t commit -qm init
 input() { printf '{"cwd":"%s","session_id":"%s"}' "$P" "${1:-s1}"; }
-conf() { printf '{"acme/my-web-app":{"code_re":"^src/.*\\\\.ts$","verify":"%s","limit":%s}}' "$1" "${2:-120}" > "$HOME/.claude/stop-verify.projects.json"; rm -rf "$HOME/.claude/state"; }
+PR="$(cd "$P" && pwd -P)"
+conf() { printf '{"acme/my-web-app":{"roots":["%s"],"code_re":"^src/.*\\\\.ts$","verify":"%s","limit":%s}}' "$PR" "$1" "${2:-120}" > "$HOME/.claude/stop-verify.projects.json"; rm -rf "$HOME/.claude/state"; }
 run_hook() { input "$@" | bash "$H"; }
 
 expect_rc 0 "hook: no config file -> silent pass"   run_hook
@@ -65,6 +77,11 @@ conf "exit 1"; expect_rc 2 "hook: block 1"                    run_hook s2
 grep -q 'still fails' "$T/out" && ok "hook: says checks are red" || bad "hook: red message"
                expect_rc 0 "hook: same red state not re-blocked" run_hook s3
 conf "true" 5; expect_rc 2 "hook: limit under 60s counts as timeout failure" run_hook
+conf "true" "\"abc\""; expect_rc 0 "hook: non-numeric limit is rejected, not run" run_hook
+grep -q 'limit must be' "$T/out" && ok "hook: says the limit is invalid" || bad "hook: limit message"
+C2="$T/clone2"; git clone -q "$P" "$C2"; git -C "$C2" remote set-url origin https://example.com/acme/my-web-app.git; echo z >> "$C2/src/a.ts"
+conf "exit 1"
+printf '{"cwd":"%s","session_id":"c2"}' "$C2" | bash "$H" >"$T/out" 2>&1; [[ $? == 0 ]] && ok "hook: same owner/repo at an untrusted path -> not run" || bad "hook: ran an untrusted checkout"
 conf "kill -9 \$\$"; expect_rc 2 "hook: signal death is a failure" run_hook
 A="$T/attacker"; mkdir -p "$A/src"; git -C "$A" init -q; git -C "$A" remote add origin git@example.com:attacker/my-web-app.git
 echo x > "$A/src/a.ts"; conf "exit 1"
@@ -75,14 +92,17 @@ expect_rc 0 "hook: VERIFY_CHANGED is one file per line" run_hook
 # test guard
 G="$T/guard"; mkdir -p "$G/src" "$G/tests"; git -C "$G" init -q; git -C "$G" remote add origin https://example.com/acme/guarded.git
 echo a > "$G/src/a.ts"; echo t > "$G/tests/a.test.ts"; git -C "$G" add -A; git -C "$G" -c user.email=t@t -c user.name=t commit -qm init
-printf '{"acme/guarded":{"code_re":"^(src|tests)/.*\\\\.ts$","tests_re":"^tests/","verify":"true","limit":120}}' > "$HOME/.claude/stop-verify.projects.json"; rm -rf "$HOME/.claude/state"
+GR="$(cd "$G" && pwd -P)"
+printf '{"acme/guarded":{"roots":["%s"],"code_re":"^(src|tests)/.*\\\\.ts$","tests_re":"^tests/","verify":"true","limit":120}}' "$GR" > "$HOME/.claude/stop-verify.projects.json"; rm -rf "$HOME/.claude/state"
 ginput() { printf '{"cwd":"%s","session_id":"%s"}' "$G" "$1" | bash "$H"; }
 echo b >> "$G/src/a.ts"; echo weaker > "$G/tests/a.test.ts"
 expect_rc 2 "guard: fix + edited existing test -> blocked" ginput g1
 grep -q 'test guard' "$T/out" && ok "guard: says why" || bad "guard: message"
 git -C "$G" checkout -q tests/a.test.ts; echo n > "$G/tests/new.test.ts"
 expect_rc 0 "guard: fix + NEW test file -> allowed" ginput g2
-git -C "$G" checkout -q src/a.ts; rm "$G/tests/new.test.ts"; echo weaker > "$G/tests/a.test.ts"
+rm "$G/tests/new.test.ts"; git -C "$G" checkout -q src/a.ts; echo weaker > "$G/tests/a.test.ts"; echo new > "$G/src/added.ts"
+expect_rc 2 "guard: NEW code file + edited existing test -> blocked" ginput g4
+rm "$G/src/added.ts"
 expect_rc 0 "guard: test-only change -> allowed" ginput g3
 git -C "$G" checkout -q tests/a.test.ts
 
@@ -94,7 +114,12 @@ expect_rc 64 "evidence: dirty tree refused" in_g -- true
 git -C "$G" checkout -q src/a.ts
 printf '.scratch/\n' > "$G/.gitignore"; git -C "$G" add .gitignore; git -C "$G" -c user.email=t@t -c user.name=t commit -qm ignore
 expect_rc 0 "evidence: passing command" in_g -- true
-grep -q "$(git -C "$G" rev-parse HEAD)" "$T/out" && grep -q 'sha256' "$T/out" && ok "evidence: names the commit and log hash" || bad "evidence: block shape"
+LOGF="$(sed -n 's/^- Full log: `\([^`]*\)` (sha256 `[0-9a-f]*`)$/\1/p' "$T/out")"; HSH="$(sed -n 's/^- Full log: `[^`]*` (sha256 `\([0-9a-f]*\)`)$/\1/p' "$T/out")"
+grep -q "$(git -C "$G" rev-parse HEAD)" "$T/out" && [[ -f "$LOGF" && "$(shasum -a 256 "$LOGF" | cut -d' ' -f1)" == "$HSH" ]] && ok "evidence: names the commit; log hash matches the file" || bad "evidence: commit or hash"
+[[ -z "$(git -C "$G" status --porcelain)" ]] && ok "evidence: log is written outside the work tree" || bad "evidence: dirtied the tree"
+expect_rc 3 "evidence: tree changed during run -> exit 3 INVALID" in_g -- touch src/during.ts
+grep -q INVALID "$T/out" && ok "evidence: says INVALID" || bad "evidence: INVALID label"
+rm -f "$G/src/during.ts"
 expect_rc 1 "evidence: failing command keeps exit code" in_g -- false
 grep -q FAIL "$T/out" && ok "evidence: says FAIL" || bad "evidence: FAIL label"
 

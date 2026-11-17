@@ -18,7 +18,7 @@ Decide the route, state the reason in one line, do not ask.
 1. Restate the symptom in one line. Pin the target: repo, HEAD, uncommitted files.
 2. Write down the correct end state and the broken one. Reproduce on the real code with the smallest script or test, from a clean start; see the broken state twice, resetting in between. Never inject data or state to "create" the bug. Not seen twice → the verdict is "inconclusive", not "fixed"; do not guess-fix.
    - Ask: can this state happen in normal use? Yes → fix the data flow. No → reject it at the entry point. Fix the pattern, not one spot.
-3. Find the cause (file:line). Write the failing test first, then the smallest fix, then watch the test pass. If another session has uncommitted work in the same files, fix in an isolated copy and apply a patch.
+3. Find the cause (file:line). Hand the repro to a different agent to write the failing test and commit it on its own; then make the smallest fix without editing that test, and watch it pass. If another session has uncommitted work in the same files, fix in an isolated copy and apply a patch.
 4. Run the blast radius.
 5. Same kind of bug a second time → `verify-loop` triage, to turn it into a check.
 6. Hand over through `verify-loop` done.
