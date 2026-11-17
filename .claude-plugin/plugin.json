@@ -1,0 +1,7 @@
+{
+  "name": "verify-loop",
+  "version": "0.1.0",
+  "description": "A verification workflow for people who direct coding agents but do not read code: a Stop hook that runs your tests, a safe Codex dispatch wrapper, and two entry skills (verify, debug).",
+  "license": "MIT",
+  "keywords": ["verification", "hooks", "testing", "codex", "workflow"]
+}

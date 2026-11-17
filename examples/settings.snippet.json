@@ -1,0 +1,26 @@
+{
+  "_comment": "Merge by hand into ~/.claude/settings.json (or a project's .claude/settings.local.json). Adjust paths. Deny rules are checked before auto mode. Denying `codex *` blocks direct Codex calls; the wrapper script still runs because its command line does not start with `codex`.",
+  "permissions": {
+    "deny": [
+      "Read(~/.ssh/**)",
+      "Read(//path/to/your/key-backups/**)",
+      "Bash(codex *)",
+      "Bash(codex)",
+      "Bash(npm run deploy)",
+      "Bash(npm run deploy *)"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "excludedCommands": [
+      "/absolute/path/to/codex-dispatch.sh *"
+    ],
+    "network": {
+      "allowLocalBinding": true,
+      "allowedDomains": [
+        "github.com",
+        "registry.npmjs.org"
+      ]
+    }
+  }
+}

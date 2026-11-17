@@ -1,0 +1,7 @@
+{
+  "name": "verify-loop",
+  "owner": { "name": "verify-loop contributors" },
+  "plugins": [
+    { "name": "verify-loop", "source": "./", "description": "Verification workflow: Stop hook, Codex dispatch wrapper, verify and debug skills." }
+  ]
+}
