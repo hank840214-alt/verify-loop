@@ -25,6 +25,7 @@
 ## 注意
 - 停止 hook 用你的帳號權限、在 Claude Code 沙盒外跑測試指令；AI 能改 `package.json` 或測試，hook 之後會照跑。信任是看路徑：在登記的資料夾切到別人的分支或 PR，hook 會用你的權限跑那個分支的測試腳本。外部 PR 請用另一份沒登記的 clone；要隔離就讓 `verify` 自己啟動容器或 VM。
 - 停止 hook 不會偵測用 skip-worktree／assume-unchanged 藏起來的檔案；evidence 腳本仍會拒絕這種情況。
+- 同一個 checkout 同時收工，可能各自跑檢查、各自被擋；另一個 session 記下的通過，可能蓋過這個 session 先前對同一份程式的失敗。
 - 只要登記的 repo 有改動（包括你自己沒做完的），hook 就會觸發。失敗不是這個 session 造成時，Claude 被要求說明並停手，但它仍可能去改。
 - Codex 唯讀模式仍讀得到你帳號能讀的所有檔案；派工腳本限制的是寫入和網路，不是讀取。
 - 「預設斷網」是派工腳本傳給 Codex 的設定（`sandbox_workspace_write.network_access=false`）；測試只檢查有傳這個設定，沒測實際連線。請在你的 Codex 版本上確認一次。

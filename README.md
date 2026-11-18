@@ -73,6 +73,7 @@ bash tests/run.sh
 ## Limits — read these
 - The Stop hook runs your test command with your user's permissions, outside Claude Code's sandbox. The agent can edit `package.json` or the tests, and the hook will then run them. Trust is by path: if you check out someone else's branch or PR in a listed checkout, the hook runs that branch's test scripts as you. Only register checkouts where you run code you trust, have `/verify-loop done` list changes to test scripts in the PR, and use a separate clone (not in `roots`) for outside PRs. To isolate the run, make `verify` start a container or VM yourself.
 - The stop hook does not look for files hidden with skip-worktree/assume-unchanged; the evidence script still refuses them.
+- Stops at the same time on one checkout can each run the checks and each block. A pass recorded by another session can hide this session's earlier failure of the same code.
 - The hook fires whenever a registered repo has changed code, including your own unfinished work. Claude is told to stop, not edit, when the failures are not from its session, but it may still try.
 - Codex in read-only mode can still read any file your user can read. The wrapper limits writes and network, not reads.
 - "Network off" is a Codex setting the wrapper passes (`sandbox_workspace_write.network_access=false`); the tests check the flag, not real traffic. Check it once on your Codex version.

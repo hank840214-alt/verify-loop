@@ -236,7 +236,10 @@ dcap s6 "$CAP_DISPATCH"; [[ $? == 0 && ! -s "$T/out" ]] && ok "busy: codex-dispa
 dcap s6 '{"id":"x","type":"subagent","status":"completed","description":"done"}'; [[ $? == 2 ]] && ok "busy: completed subagent does not defer" || bad "busy: completed"
 dcap s6y '{"id":"y","type":"shell","status":"running","description":"log","command":"tail -f codex-dispatch.log"}'; [[ $? == 2 ]] && ok "busy: tail -f codex-dispatch.log does not defer" || bad "busy: log tail"
 dcap s6c '{"id":"c","type":"shell","status":"running","description":"dev","command":"npm run serve"}'; [[ $? == 2 ]] && ok "busy: a dev server shell does not defer" || bad "busy: dev server"
-dcap s6 '7,"str",{"type":"shell","command":9},{"type":"subagent","status":"running"}'; [[ $? == 0 ]] && ok "busy: odd list items never break the hook" || bad "busy: odd items"
+dcap s6o '7,"str",{"type":"shell","command":9},{"type":"subagent","status":"running"}'; rc=$?
+[[ $rc == 0 && ! -s "$T/out" && "$(tail -1 "$LED" | cut -f5)" == deferred ]] && ok "busy: odd list items are ignored per item, the subagent still defers" || bad "busy: odd items rc=$rc"
+dcap s6q '{"id":"q","type":"shell","status":"running","description":"d","command":"bash \"/x/tools/codex-dispatch.sh\" -f t.md &"}'; [[ $? == 0 && ! -s "$T/out" ]] && ok "busy: quoted codex-dispatch.sh path defers" || bad "busy: quoted dispatch"
+dcap s6t '{"id":"t","type":"shell","status":"running","description":"d","command":"tail -f /x/codex-dispatch.sh"}'; [[ $? == 2 ]] && ok "busy: tail of the script file does not defer" || bad "busy: tail of script"
 dcap s7 ''; [[ $? == 2 ]] && ok "busy: empty list -> checked" || bad "busy: empty list"
 HENV=STOP_VERIFY_DRY=1 dcap s6 "$CAP_SUB"; grep -q '^\[dry\]' "$T/out" && ok "busy: DRY never defers" || bad "busy: DRY deferred"
 git -C "$DP" checkout -q src/a.ts; dconf "exit 1"; mkdir -p "$DP/junk"; echo j > "$DP/junk/left.ts"
@@ -290,6 +293,7 @@ dconf "exit 1"; git -C "$DP" checkout -q src/a.ts
 for i in 1 2 3; do echo "n$i" >> "$DP/src/a.ts"; expect_rc 2 "accumulate: no stop_hook_active field, block $i" dhook acc; done
 echo n4 >> "$DP/src/a.ts"; expect_rc 0 "accumulate: 4th new state is released" dhook acc
 grep -q 'blocked 3 times in a row and is now allowed to stop' "$T/out" && ok "accumulate: release text names the streak" || bad "accumulate: text"
+expect_rc 2 "accumulate: the streak reset, the released state is not remembered as blocked" dhook acc
 # state files
 dconf "head -c 3000000 /dev/zero | tr '\\\\0' x; exit 1"; git -C "$DP" checkout -q src/a.ts; echo cap >> "$DP/src/a.ts"
 dhook cap; sz="$(wc -c < "$SD"/*.fail.log | tr -d ' ')"
@@ -300,17 +304,41 @@ if [[ "$(id -u)" != 0 ]]; then
   dconf "exit 1"; mkdir -p "$SD"; chmod 500 "$SD"; git -C "$DP" checkout -q src/a.ts; echo ro >> "$DP/src/a.ts"
   expect_rc 0 "state: unwritable state dir -> never blocks" dhook ro; grep -q 'cannot write state in' "$T/out" && ok "state: says why, with the folder" || bad "state: no message"
   chmod 700 "$SD"
+  dconf "exit 1"; mkdir -p "$SD"; chmod 500 "$SD"; echo keep > "$T/keepme"; git -C "$DP" checkout -q src/a.ts; echo ro2 >> "$DP/src/a.ts"
+  HENV="LOG=$T/keepme LIST=$T/keepme" dhook ro2; chmod 700 "$SD"
+  [[ -f "$T/keepme" ]] && ok "state: inherited LOG/LIST env files are never deleted" || bad "state: deleted a file named by env"
 fi
-dconf "exit 1"; git -C "$DP" checkout -q src/a.ts; echo led >> "$DP/src/a.ts"; dhook led
+dconf "exit 1"; git -C "$DP" checkout -q src/a.ts; echo led >> "$DP/src/a.ts"; mkdir -p "$SD"; : > "$SD/ledger.tsv"; chmod 644 "$SD/ledger.tsv"; dhook led
 [[ "$(fmode "$SD/ledger.tsv")" == 600 ]] && ok "ledger: mode 600" || bad "ledger: mode"
 TP="$T/tab"$'\t'"dir"; mkdir -p "$TP/src"; git -C "$TP" init -q; git -C "$TP" remote add origin https://example.com/acme/dapp.git; echo a > "$TP/src/a.ts"; git -C "$TP" add -A; git -C "$TP" -c user.email=t@t -c user.name=t commit -qm i; echo b >> "$TP/src/a.ts"
 TPR="$(cd "$TP" && pwd -P)"; jq -n --arg r "$TPR" '{"acme/dapp":{roots:[$r],code_re:"^src/",verify:"exit 1"}}' > "$HOME/.claude/stop-verify.projects.json"; /bin/rm -rf "$HOME/.claude/state"
 jq -nc --arg c "$TP" '{cwd:$c,session_id:"tab"}' | bash "$H" >"$T/out" 2>&1
 awk -F'\t' 'NF!=9{bad=1} END{exit bad}' "$LED" && [[ -s "$LED" ]] && ok "ledger: a tab in the folder name keeps 9 fields" || bad "ledger: tab in folder name"
+# files written by verify itself, forced re-run, excerpt bytes, symlinks, limits
+dconf 'echo x >> '"$RAN"'; echo $RANDOM$RANDOM > out.json; exit 1'; git -C "$DP" checkout -q src/a.ts; echo vw >> "$DP/src/a.ts"
+expect_rc 2 "verify output: first stop blocks" dhook vw ',"stop_hook_active":true'
+expect_rc 0 "verify output: second stop is released" dhook vw ',"stop_hook_active":true'
+expect_rc 0 "verify output: third stop is released" dhook vw ',"stop_hook_active":true'
+[[ "$(druns)" == 1 ]] && ok "verify output: a file written by verify does not cause re-runs" || bad "verify output: ran $(druns)"
+/bin/rm -f "$SD"/*.red; expect_rc 0 "force: after deleting <id>.red the checks run again" dhook vw ',"stop_hook_active":true'
+[[ "$(druns)" == 2 ]] && ok "force: it was a real re-run" || bad "force: ran $(druns)"
+/bin/rm -f "$DP/out.json"
+dconf "printf 'not ok 1 - first\\\\n\\\\xff bad bytes\\\\nnot ok 2 - second\\\\n'; exit 1"; echo ex >> "$DP/src/a.ts"; dhook ex
+grep -q 'not ok 1 - first' "$T/out" && grep -q 'not ok 2 - second' "$T/out" && ok "excerpt: a non-UTF-8 byte does not eat the next lines" || bad "excerpt: bytes"
+dconf "exit 1"; git -C "$DP" checkout -q src/a.ts; echo mx >> "$DP/src/a.ts"
+echo mx0 > "$DP/data.txt"; ln -s ../data.txt "$DP/src/l.ts"; dconf "echo x >> $RAN; true"
+dhook ln; dhook ln; echo changed > "$DP/data.txt"; dhook ln
+[[ "$(druns)" == 2 ]] && ok "symlink: changed target content re-runs, unchanged is cached" || bad "symlink: ran $(druns)"
+/bin/rm -f "$DP/src/l.ts" "$DP/data.txt"; git -C "$DP" checkout -q src/a.ts
+dconf "true" 100; HENV="STOP_VERIFY_DEADLINE=120" dhook lim; grep -q 'limit must be 1-90' "$T/out" && ok "limit: must leave 30 s below the deadline" || bad "limit: deadline-30"
 # bad config types
 printf '{"acme/dapp":{"roots":["%s"],"code_re":"^src/","skip_re":["x"],"verify":"exit 1"}}' "$DPR" > "$HOME/.claude/stop-verify.projects.json"; echo sr >> "$DP/src/a.ts"
 expect_rc 0 "config: skip_re as an array -> message, no crash, no block" dhook cfg
 grep -q 'invalid skip_re in config for acme/dapp: must be a string' "$T/out" && ok "config: says which field must be a string" || bad "config: message"
+printf '{"acme/dapp":{"roots":["%s"],"code_re":"^src/","verify":["true"]}}' "$DPR" > "$HOME/.claude/stop-verify.projects.json"; dhook cfg2
+grep -q 'invalid verify in config' "$T/out" && ok "config: verify must be a string" || bad "config: verify type"
+printf '{"acme/dapp":{"roots":["%s"],"code_re":"^src/","tests_re":null,"verify":"true"}}' "$DPR" > "$HOME/.claude/stop-verify.projects.json"; dhook cfg3
+grep -q 'invalid tests_re in config' "$T/out" && ok "config: an explicit null regex is invalid" || bad "config: null regex"
 # skip_re also applies to the guard's existing-test list
 git -C "$DP" checkout -q src/a.ts; mkdir -p "$DP/tests/gen"; echo g > "$DP/tests/gen/x.ts"; git -C "$DP" add -A; git -C "$DP" -c user.email=t@t -c user.name=t commit -qm gen
 printf '{"acme/dapp":{"roots":["%s"],"code_re":"^(src|tests)/","tests_re":"^tests/","skip_re":"^tests/gen/","verify":"true"}}' "$DPR" > "$HOME/.claude/stop-verify.projects.json"; /bin/rm -rf "$HOME/.claude/state"

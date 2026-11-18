@@ -62,7 +62,7 @@ ACTIVE="$(printf '%s' "$INPUT" | jq -r '.stop_hook_active | tostring')"   # "fal
 BUSY="$(printf '%s' "$INPUT" | jq -r '[(.background_tasks? // []) | if type == "array" then .[] else empty end
   | select(type == "object" and ((.status // "running") == "running")
     and (.type == "subagent" or .type == "workflow"
-      or (.type == "shell" and ((.command | type) == "string") and (.command | test("(^|[[:space:]/])codex-dispatch\\.sh([[:space:]]|$)")))))] | length' 2>/dev/null)"
+      or (.type == "shell" and ((.command | type) == "string") and (.command | test("(^|[[:space:]/])codex-dispatch\\.sh([^[:alnum:]._-]|$)")) and ((.command | test("^[[:space:]]*(tail|cat|less|grep|head)([[:space:]]|$)")) | not))))] | length' 2>/dev/null)"
 [[ -n "$CWD" && -d "$CWD" ]] || exit 0
 
 export NPM_CONFIG_UPDATE_NOTIFIER=false
@@ -93,17 +93,17 @@ re_ok() { [[ -z "$1" ]] && return 0; [[ "" =~ $1 ]]; [[ $? -le 1 ]]; }
 uncommitted_z() { git diff -z --no-renames --name-only HEAD && git ls-files -z --others --exclude-standard; }
 
 verify_root() {
-  local ROOT="$1" KEY="$2" fld
+  local ROOT="$1" KEY="$2" fld LOG="" LIST="" FT=""   # LOG, LIST, FT: only paths this run creates are ever removed
   cd "$ROOT" || return 0
-  for fld in code_re tests_re skip_re; do
-    jq -e --arg k "$KEY" --arg f "$fld" '.[$k][$f] as $v | $v == null or ($v | type) == "string"' "$CONF" >/dev/null 2>&1 \
+  for fld in code_re tests_re skip_re verify; do
+    jq -e --arg k "$KEY" --arg f "$fld" '.[$k] | if has($f) then (.[$f] | type) == "string" else true end' "$CONF" >/dev/null 2>&1 \
       || { msg "invalid $fld in config for $KEY: must be a string"; return 0; }
   done
   local CODE_RE SKIP_RE VERIFY REQ LIMIT TESTS_RE
   CODE_RE="$(field "$KEY" code_re)"; VERIFY="$(field "$KEY" verify)"; TESTS_RE="$(field "$KEY" tests_re)"; SKIP_RE="$(field "$KEY" skip_re)"
   REQ="$(field "$KEY" requires)"; LIMIT="$(field "$KEY" limit)"; LIMIT="${LIMIT:-480}"
   [[ -n "$CODE_RE" && -n "$VERIFY" ]] || return 0
-  [[ "$LIMIT" =~ ^[0-9]{1,6}$ ]] && LIMIT=$((10#$LIMIT)) && (( LIMIT >= 1 && LIMIT <= DEADLINE )) || { msg "$KEY: limit must be 1-$DEADLINE seconds; checks skipped"; return 0; }
+  [[ "$LIMIT" =~ ^[0-9]{1,6}$ ]] && LIMIT=$((10#$LIMIT)) && (( LIMIT >= 1 && LIMIT <= DEADLINE - 30 )) || { msg "$KEY: limit must be 1-$((DEADLINE - 30)) seconds; checks skipped"; return 0; }
   re_ok "$CODE_RE" && re_ok "$TESTS_RE" && re_ok "$SKIP_RE" || { msg "$KEY: invalid regex in config; checks skipped"; return 0; }
   if [[ -n "$REQ" && ! -e "$ROOT/$REQ" ]]; then msg "$KEY: $REQ is missing, checks skipped"; return 0; fi
   local BASE
@@ -114,75 +114,88 @@ verify_root() {
   is_skip() { [[ -n "$SKIP_RE" && "$1" =~ $SKIP_RE ]]; }
   is_code() { [[ "$1" =~ $CODE_RE ]] && ! is_skip "$1"; }
   is_test() { [[ -n "$TESTS_RE" && "$1" =~ $TESTS_RE ]] && ! is_skip "$1"; }
-  local f CODE=() TESTF=() OTHER=() UNC_CODE=0 LZ
-  LZ="$(mktemp "${TMPDIR:-/tmp}/stop-verify-z.XXXXXX")" || note "mktemp failed; verification skipped"
-  if ! { uncommitted_z && { [[ -z "$BASE" ]] || git diff -z --no-renames --name-only "$BASE"...HEAD; }; } >"$LZ" 2>/dev/null; then
-    /bin/rm -f "$LZ"; msg "$KEY: git could not list the changed files; checks NOT run"; return 0
-  fi
-  while IFS= read -r -d '' f; do
-    is_skip "$f" && continue
-    if is_code "$f"; then CODE+=("$f"); else OTHER+=("$f"); fi
-    if is_test "$f"; then TESTF+=("$f"); fi
-  done < <(sort -zu "$LZ")
-  /bin/rm -f "$LZ"
+  local f CODE=() TESTF=() OTHER=() UNC_CODE=0
+  list_files() {  # fills CODE, TESTF, OTHER; returns 1 when git cannot list the changes
+    local LZ; CODE=(); TESTF=(); OTHER=()
+    LZ="$(mktemp "${TMPDIR:-/tmp}/stop-verify-z.XXXXXX")" || note "mktemp failed; verification skipped"
+    if ! { uncommitted_z && { [[ -z "$BASE" ]] || git diff -z --no-renames --name-only "$BASE"...HEAD; }; } >"$LZ" 2>/dev/null; then
+      /bin/rm -f "$LZ"; return 1
+    fi
+    while IFS= read -r -d '' f; do
+      is_skip "$f" && continue
+      if is_code "$f"; then CODE+=("$f"); else OTHER+=("$f"); fi
+      if is_test "$f"; then TESTF+=("$f"); fi
+    done < <(sort -zu "$LZ")
+    /bin/rm -f "$LZ"
+  }
+  list_files || { msg "$KEY: git could not list the changed files; checks NOT run"; return 0; }
   if (( ${#CODE[@]} == 0 )); then
     [[ "${STOP_VERIFY_DRY:-0}" == 1 ]] && echo "[dry] $KEY: no changed files match code_re (base: ${BASE:-none})" >&2
     return 0
   fi
 
   (umask 077; mkdir -p "$STATE_DIR") || return 0
-  no_state() { /bin/rm -f "${LOG:-}" "${LIST:-}"; msg "$KEY: cannot write state in $STATE_DIR; not blocking. Fix the folder permissions."; exit 0; }
+  no_state() { [[ -n "$LOG" ]] && /bin/rm -f "$LOG"; [[ -n "$LIST" ]] && /bin/rm -f "$LIST"; [[ -n "$FT" ]] && /bin/rm -f "$FT"; msg "$KEY: cannot write state in $STATE_DIR; not blocking. Fix the folder permissions."; exit 0; }
   [[ -w "$STATE_DIR" ]] || no_state
   wr() {  # file, content: atomic write inside the state dir
     local t; t="$(mktemp "$STATE_DIR/.w.XXXXXX" 2>/dev/null)" && printf '%s\n' "$2" > "$t" && mv -f "$t" "$1" || { [[ -n "$t" ]] && /bin/rm -f "$t"; no_state; }
   }
   find "$STATE_DIR" -name '*.blocks' -mtime +7 -delete 2>/dev/null
-  local S BLOCKS=0 SET="" RED="" REDV="" PFP RFP HLEFT
+  local S BLOCKS=0 SET="" REDALL="" PFP="" RFP="" RFP2=""
   S="$STATE_DIR/$(printf '%s' "$ROOT" | hsum | cut -c1-16)"
   { { read -r BLOCKS _; SET="$(cat)"; } < "$S.$SESSION.blocks"; } 2>/dev/null
-  { read -r RED REDV < "$S.red"; } 2>/dev/null
+  REDALL="$(cat "$S.red" 2>/dev/null)"   # lines "<state> <verdict> [<state after the run>]", last 20
   [[ "$BLOCKS" =~ ^[0-9]+$ ]] || BLOCKS=0
   [[ "$ACTIVE" == false ]] && BLOCKS=0
-
-  # Fingerprints. PFP (pass cache): HEAD, verify command, limit, and type, mode and content of
-  # every changed code or test file. RFP (red cache, blocks): PFP plus all other changed files.
-  HLEFT=$((DEADLINE - SECONDS - 60)); (( HLEFT < 1 )) && HLEFT=1
-  fp_part() {  # files... -> kind+mode of each path, then content hashes (deleted paths hash as "deleted")
-    local f k H=()
-    for f in "$@"; do
-      if [[ -L "$f" ]]; then k="link $(readlink "$f")"
-      elif [[ -f "$f" ]]; then k=file; [[ -x "$f" ]] && k="file x"; H+=("$f")
-      elif [[ -e "$f" ]]; then k=other; else k=deleted; fi
-      printf '%s %s\0' "$k" "$f"
-    done
-    if (( ${#H[@]} )); then printf '%s\0' "${H[@]}" | run_limited "$HLEFT" xargs -0 "$HASH" -- 2>/dev/null || echo "hash-incomplete $RANDOM$RANDOM"; fi
-    return 0
-  }
-  PFP="$( { git rev-parse HEAD 2>/dev/null; printf '%s\n%s\n' "$VERIFY" "$LIMIT"; fp_part ${CODE[@]+"${CODE[@]}"} ${TESTF[@]+"${TESTF[@]}"}; } | hsum | cut -c1-40)"
-  RFP="$( { printf '%s\n' "$PFP"; fp_part ${OTHER[@]+"${OTHER[@]}"}; } | hsum | cut -c1-40)"
-  [[ ${#PFP} == 40 && ${#RFP} == 40 ]] || { msg "could not fingerprint changes; checks skipped"; return 0; }
 
   local LOAD; LOAD="$(uptime 2>/dev/null | sed 's/.*load average[s]*: *//; s/[, ].*//')"
   led() {  # verdict, action, seconds -> one ledger line (local file, mode 600, never printed)
     local d="${ROOT##*/}"; d="${d//[$'\t\r\n']/_}"
-    ( umask 077; printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "${KEY//[^A-Za-z0-9._\/-]/_}" "$d" "${SESSION:0:8}" \
+    ( umask 077; [[ -e "$STATE_DIR/ledger.tsv" ]] && chmod 600 "$STATE_DIR/ledger.tsv"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "${KEY//[^A-Za-z0-9._\/-]/_}" "$d" "${SESSION:0:8}" \
       "$1" "$2" "$3" "$LOAD" "${RFP:0:12}" >> "$STATE_DIR/ledger.tsv" ) 2>/dev/null
   }
+  # Fingerprints. PFP (pass cache): HEAD, verify command, limit, and type, mode and content of
+  # every changed code or test file. RFP (red cache, blocks): PFP plus all other changed files.
+  fp_part() {  # files... -> kind+mode of each path, then content hashes (deleted paths hash as "deleted")
+    local f k H=() HL=$((DEADLINE - SECONDS - 60)); (( HL < 1 )) && HL=1
+    for f in "$@"; do
+      if [[ -L "$f" ]]; then
+        k="link $(readlink "$f") $([[ -f "$f" ]] && echo file || { [[ -d "$f" ]] && echo dir || echo broken; })"; [[ -f "$f" ]] && H+=("$f")
+      elif [[ -f "$f" ]]; then k=file; [[ -x "$f" ]] && k="file x"; H+=("$f")
+      elif [[ -e "$f" ]]; then k=other; else k=deleted; fi
+      printf '%s %s\0' "$k" "$f"
+    done
+    if (( ${#H[@]} )); then printf '%s\0' "${H[@]}" | run_limited "$HL" xargs -0 "$HASH" -- 2>/dev/null || echo "hash-incomplete $RANDOM$RANDOM"; fi
+    return 0
+  }
+  fingerprint() {  # sets PFP and RFP from CODE, TESTF, OTHER; returns 1 when the time budget is spent
+    (( DEADLINE - SECONDS - 60 >= 1 )) || return 1
+    PFP="$( { git rev-parse HEAD 2>/dev/null; printf '%s\n%s\n' "$VERIFY" "$LIMIT"; fp_part ${CODE[@]+"${CODE[@]}"} ${TESTF[@]+"${TESTF[@]}"}; } | hsum | cut -c1-40)"
+    (( DEADLINE - SECONDS - 60 >= 1 )) || return 1
+    RFP="$( { printf '%s\n' "$PFP"; fp_part ${OTHER[@]+"${OTHER[@]}"}; } | hsum | cut -c1-40)"
+  }
+  fingerprint || { led skipped ok 0; msg "$KEY: not enough time left in this stop to run checks; not verified"; return 0; }
+  [[ ${#PFP} == 40 && ${#RFP} == 40 ]] || { msg "could not fingerprint changes; checks skipped"; return 0; }
+  redline() { grep -m1 -e "^$RFP " -e " $RFP\$" <<<"$REDALL"; }
+  redm() { [[ -n "$(redline)" ]]; }   # a saved failure is for this state
+
   # One block per exact state per session (a set, so going back to an earlier state is not blocked
   # again); MAX_BLOCKS blocks in a row. Returns 0 when Claude may stop, 1 when this stop is blocked.
   released() {  # verdict, seconds
-    local N="$BLOCKS"
+    local N="$BLOCKS" ADD
     if grep -q "^$RFP " <<<"$SET"; then
       led "$1" released "$2"
       msg "$KEY: NOT VERIFIED ($1) in $ROOT. Claude was already blocked for this exact state and stopped anyway. It is not re-run until the files change."
       return 0
     fi
-    SET="$(printf '%s\n%s %s\n' "$SET" "$RFP" "$1" | grep . | tail -50)"
-    if (( BLOCKS >= MAX_BLOCKS )); then
+    if (( BLOCKS >= MAX_BLOCKS )); then   # the streak resets; this state is not remembered as blocked
       wr "$S.$SESSION.blocks" "$(printf '0\n%s' "$SET")"; led "$1" released "$2"
       msg "$KEY: NOT VERIFIED ($1) in $ROOT. Claude was blocked $N times in a row and is now allowed to stop. Checks are red."
       return 0
     fi
+    ADD="$RFP $1"; [[ -n "$RFP2" ]] && ADD="$ADD"$'\n'"$RFP2 $1"   # RFP2: the state after the run (verify may write files)
+    SET="$(printf '%s\n%s\n' "$SET" "$ADD" | grep . | tail -50)"
     wr "$S.$SESSION.blocks" "$(printf '%s\n%s' "$((BLOCKS + 1))" "$SET")"; led "$1" block "$2"; return 1
   }
   if (( ${BUSY:-0} > 0 )) && [[ "${STOP_VERIFY_DRY:-0}" != 1 ]]; then led deferred ok 0; return 0; fi
@@ -229,13 +242,12 @@ verify_root() {
     return 0
   fi
   local PREV; PREV="$(grep -m1 "^$RFP " <<<"$SET")"
-  if [[ -n "$PREV" ]]; then released "${PREV#* }" 0; return 0; fi   # this session was already blocked for this state
+  if [[ -n "$PREV" ]] && redm; then released "${PREV#* }" 0; return 0; fi   # already blocked here; deleting <id>.red forces a re-run
 
-  local LOG LIST RC=1 START SECS=0 LEFT FT V="${REDV:-fail}"
-  if [[ "$RED" != "$RFP" ]]; then   # a state that already failed is not run again
+  local RC=1 START SECS=0 LEFT V; V="$(redline | cut -d' ' -f2)"; V="${V:-fail}"
+  if ! redm; then   # a state that already failed is not run again
     LEFT=$((DEADLINE - SECONDS))
-    if (( LEFT < 60 )); then led skipped ok 0; msg "$KEY: not enough time left in this stop to run checks; not verified"; return 0; fi
-    (( LIMIT > LEFT - 30 )) && LIMIT=$((LEFT - 30))
+    if (( LEFT < LIMIT + 30 )); then led skipped ok 0; msg "$KEY: not enough time left in this stop to run checks; not verified"; return 0; fi
     LOG="$(mktemp "${TMPDIR:-/tmp}/stop-verify.XXXXXX")" || note "mktemp failed; verification skipped"
     LIST="$(mktemp "${TMPDIR:-/tmp}/stop-verify-list.XXXXXX")" || note "mktemp failed; verification skipped"
     printf '%s\n' "${CODE[@]}" > "$LIST"
@@ -248,12 +260,16 @@ verify_root() {
     fi
     V=fail; (( RC == 124 )) && V=timeout
     FT="$(mktemp "$STATE_DIR/.f.XXXXXX")" && tail -c 2000000 "$LOG" > "$FT" && mv -f "$FT" "$S.fail.log" || no_state
-    /bin/rm -f "$LOG"; wr "$S.red" "$RFP $V"
+    /bin/rm -f "$LOG"
+    local P0="$PFP" R0="$RFP"   # verify may have written files: remember the state after the run too
+    if list_files && fingerprint; then RFP2="$RFP"; fi
+    PFP="$P0"; RFP="$R0"; [[ "$RFP2" == "$RFP" ]] && RFP2=""
+    wr "$S.red" "$(printf '%s\n%s %s %s' "$REDALL" "$RFP" "$V" "$RFP2" | grep . | tail -20)"
   fi
 
   if released "$V" "$SECS"; then return 0; fi
   {
-    local RAN="rc=$RC, ${SECS}s, load $LOAD"; [[ "$RED" == "$RFP" ]] && RAN="an earlier run of this exact state, not re-run"
+    local RAN="rc=$RC, ${SECS}s, load $LOAD"; redm && RAN="an earlier run of this exact state, not re-run"
     if [[ "$V" == timeout ]]; then
       echo "[stop-verify] $KEY: checks did NOT FINISH within the limit ($RAN) in $ROOT (block $((BLOCKS + 1))/$MAX_BLOCKS). This is 'not verified', not a test failure."
       echo "Editing code rarely fixes this, and finishing again will not re-run it. Tell the user the checks timed out and what the lines below show (a hung test, or a busy machine)."
@@ -266,7 +282,7 @@ verify_root() {
     [[ -f "$S.fail.log" ]] || return 2
     { if grep -q "failing tests:" "$S.fail.log"; then sed -n '/failing tests:/,$p' "$S.fail.log" | head -60
       elif grep -qE '^[[:space:]]*(not ok |✖)' "$S.fail.log"; then grep -E -A6 '^[[:space:]]*(not ok |✖)' "$S.fail.log" | head -60
-      else tail -15 "$S.fail.log"; fi; } | cut -c1-500
+      else tail -15 "$S.fail.log"; fi; } | LC_ALL=C cut -c1-500
   } >&2
   return 2
 }
