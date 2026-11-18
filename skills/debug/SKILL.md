@@ -20,7 +20,7 @@ Decide the route, state the reason in one line, do not ask.
    - Ask: can this state happen in normal use? Yes → fix the data flow. No → reject it at the entry point. Fix the pattern, not one spot.
 3. Find the cause (file:line). Hand the repro to a different agent to write the failing test and commit it on its own; then make the smallest fix without editing that test, and watch it pass. If another session has uncommitted work in the same files, fix in an isolated copy and apply a patch.
 4. Run the blast radius.
-5. Same kind of bug a second time → `verify-loop` triage, to turn it into a check.
+5. Run `verify-loop` triage to turn the bug into a check.
 6. Hand over through `verify-loop` done.
 
 ## Blast radius

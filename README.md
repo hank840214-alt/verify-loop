@@ -2,7 +2,7 @@
 
 **A verification workflow for people who direct coding agents but do not read the code.**
 
-If you build software by talking to Claude Code, Codex or Gemini CLI, you cannot review the diff yourself. So the system has to: hooks that run your tests before the agent may stop, permissions decided by "can this be undone?", and every repeated mistake turned into a check instead of another line in `AGENTS.md`.
+If you build software by talking to Claude Code, Codex or Gemini CLI, you cannot review the diff yourself. So the system has to: hooks that run your tests before the agent may stop, permissions decided by "can this be undone?", and each mistake turned into a check instead of another line in `AGENTS.md`.
 
 [繁體中文說明](README.zh-TW.md) · [The method](docs/METHOD.md) · [Credits](CREDITS.md)
 
@@ -41,13 +41,13 @@ Copy `examples/stop-verify.projects.json` to `~/.claude/stop-verify.projects.jso
 }
 ```
 
-Before you register a project, read what its tests do. If they reset a database, point `verify` at a throwaway one (see `my-db-app` in the example).
+Before you register a project, ask the agent to run `/verify-loop setup`. It reads the test setup and lists steps that reset a database, deploy, send mail or call paid APIs. If tests reset a database, point `verify` at a throwaway one (see `my-db-app` in the example).
 
 Try it without running anything (from a clone of this repo, inside your project folder):
 ```
 printf '{"cwd":"%s","session_id":"t"}' "$PWD" | STOP_VERIFY_DRY=1 bash /path/to/verify-loop/hooks/stop-verify.sh
 ```
-It prints `[dry] ...` when your project is registered and has changed files; It prints `[dry] ... no changed files` when nothing changed. If the repo is registered but this checkout is not in `roots`, the hook always says so and prints the real path to add (the `pwd -P` form; `/tmp` is `/private/tmp` on macOS). Linked worktrees of a listed checkout are trusted. No output means the repo is not registered. The session's folder must be inside the repo.
+It prints `[dry] ...` when your project is registered and has changed files. It prints `[dry] ... no changed files` when nothing changed. If the repo is registered but this checkout is not in `roots`, the hook always says so and prints the real path to add (the `pwd -P` form; `/tmp` is `/private/tmp` on macOS). Linked worktrees of a listed checkout are trusted. No output means the repo is not registered. The session's folder must be inside the repo.
 
 ### Codex dispatch
 ```
@@ -66,7 +66,7 @@ bash tests/run.sh
 ```
 
 ## Limits — read these
-- The Stop hook runs your test command with your user's permissions, outside Claude Code's sandbox. The agent can edit `package.json` or the tests, and the hook will then run them. Trust is by path: if you check out someone else's branch or PR in a listed checkout, the hook runs that branch's test scripts as you. Only register checkouts where you run code you trust, review changes to test scripts, and use a separate clone (not in `roots`) for outside PRs. To isolate the run, make `verify` start a container or VM yourself.
+- The Stop hook runs your test command with your user's permissions, outside Claude Code's sandbox. The agent can edit `package.json` or the tests, and the hook will then run them. Trust is by path: if you check out someone else's branch or PR in a listed checkout, the hook runs that branch's test scripts as you. Only register checkouts where you run code you trust, have `/verify-loop done` list changes to test scripts in the PR, and use a separate clone (not in `roots`) for outside PRs. To isolate the run, make `verify` start a container or VM yourself.
 - The hook fires whenever a registered repo has changed code, including your own unfinished work. Claude is told to stop, not edit, when the failures are not from its session, but it may still try.
 - Codex in read-only mode can still read any file your user can read. The wrapper limits writes and network, not reads.
 - "Network off" is a Codex setting the wrapper passes (`sandbox_workspace_write.network_access=false`); the tests check the flag, not real traffic. Check it once on your Codex version.
