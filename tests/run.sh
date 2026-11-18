@@ -34,11 +34,19 @@ echo old > "$REPO/.scratch/exists.md"
 expect_rc 65 "dispatch: -o existing file refused"        bash "$D" -f "$T/task.md" -s read-only -C "$REPO" -o "$REPO/.scratch/exists.md"
 expect_rc 65 "dispatch: --net with read-only refused"    bash "$D" -f "$T/task.md" -s read-only -C "$REPO" --net
 expect_rc 65 "dispatch: -m starting with - refused"      bash "$D" -f "$T/task.md" -s read-only -C "$REPO" -m --oss
-expect_rc 0  "dispatch: valid call"                      bash "$D" -f "$T/task.md" -s workspace-write -C "$REPO" -o "$REPO/.scratch/r.md"
+inrepo() { (cd "$REPO" && "$@"); }
+expect_rc 0  "dispatch: valid call (from inside the repo)" inrepo bash "$D" -f "$T/task.md" -s workspace-write -C "$REPO" -o "$REPO/.scratch/r.md"
 grep -q -- '--ignore-user-config' "$T/out" && grep -q 'network_access=false' "$T/out" && grep -q 'test-model' "$T/out" && ! grep -q other "$T/out" \
   && ok "dispatch: no user config, network off, model from top-level config" || bad "dispatch: command shape"
-bash "$D" -f "$T/task.md" -s workspace-write -C "$REPO" --net >"$T/out" 2>&1
+inrepo bash "$D" -f "$T/task.md" -s workspace-write -C "$REPO" --net >"$T/out" 2>&1
 grep -q 'network_access=true' "$T/out" && ok "dispatch: --net turns network on explicitly" || bad "dispatch: --net"
+O2="$T/other"; mkdir -p "$O2"; git -C "$O2" init -q
+expect_rc 65 "dispatch: workspace-write -C of a repo you are not in is refused" inrepo bash "$D" -f "$T/task.md" -s workspace-write -C "$O2"
+grep -q 'repo of the current folder' "$T/out" && ok "dispatch: says why (-C not the current repo)" || bad "dispatch: -C message"
+DF="$T/dotfiles"; mkdir -p "$DF"; git -C "$DF" init -q; ln -s "$HOME/.claude" "$DF/claude-link"
+expect_rc 0 "dispatch: read-only -C of another repo is fine" inrepo bash "$D" -f "$T/task.md" -s read-only -C "$O2"
+REALHOME="$(perl -e 'print((getpwuid($<))[7])')"
+expect_rc 65 "dispatch: HOME=elsewhere cannot unprotect the real ~/.claude" env HOME="$T" bash "$D" -f "$T/task.md" -s read-only --skip-git-repo-check -C "$REALHOME/.claude"
 unset DRY_RUN
 mkdir -p "$T/bin"; cat > "$T/bin/codex" <<'FAKE'
 #!/usr/bin/env bash
@@ -75,7 +83,12 @@ PATH="$T/bin:$PATH" expect_rc 73 "dispatch: .scratch swapped for a symlink durin
 [[ ! -e "$HOME/.claude/commands/swap.md" ]] && ok "dispatch: nothing written into ~/.claude" || bad "dispatch: wrote into ~/.claude"
 rm "$REPO/.scratch"; mv "$T/moved" "$REPO/.scratch"
 DRY_RUN=1 bash "$D" -f "$T/task.md" -s read-only -C "$REPO" -o "$REPO/.scratch/st.md" >"$T/out" 2>&1
-grep -q "$HOME/.local/state/codex-dispatch" "$T/out" && ok "dispatch: staging is outside /tmp and TMPDIR" || bad "dispatch: staging location"
+grep -q "$REALHOME/.local/state/codex-dispatch/" "$T/out" && ok "dispatch: staging is in the real home, outside /tmp and TMPDIR" || bad "dispatch: staging location"
+cat > "$T/bin/codex" <<'FAKE'
+#!/usr/bin/env bash
+cat >/dev/null; exit 0
+FAKE
+PATH="$T/bin:$PATH" expect_rc 74 "dispatch: -o given but Codex wrote no report -> non-zero" bash "$D" -f "$T/task.md" -s read-only -C "$REPO" -o "$REPO/.scratch/none.md"
 
 # ---------- stop-verify ----------
 H="$ROOT/hooks/stop-verify.sh"
@@ -109,7 +122,12 @@ grep -q 'limit must be' "$T/out" && ok "hook: says the limit is invalid" || bad 
 C2="$T/clone2"; git clone -q "$P" "$C2"; git -C "$C2" remote set-url origin https://example.com/acme/my-web-app.git; echo z >> "$C2/src/a.ts"
 conf "exit 1"
 printf '{"cwd":"%s","session_id":"c2"}' "$C2" | bash "$H" >"$T/out" 2>&1; [[ $? == 0 ]] && ok "hook: same owner/repo at an untrusted path -> not run" || bad "hook: ran an untrusted checkout"
-printf '{"cwd":"%s","session_id":"c2"}' "$C2" | STOP_VERIFY_DRY=1 bash "$H" >"$T/out" 2>&1; grep -q 'not in roots' "$T/out" && ok "hook: dry run names a checkout missing from roots" || bad "hook: roots miss is silent"
+grep -q 'not in roots' "$T/out" && jq -e .systemMessage "$T/out" >/dev/null && ok "hook: says a checkout is missing from roots (valid JSON)" || bad "hook: roots miss is silent"
+WT="$T/wt"; git -C "$P" worktree add -q "$WT" 2>/dev/null; echo w >> "$WT/src/a.ts"
+printf '{"cwd":"%s","session_id":"wt"}' "$WT" | bash "$H" >"$T/out" 2>&1; [[ $? == 2 ]] && ok "hook: linked worktree of a trusted checkout is checked" || bad "hook: worktree skipped"
+git -C "$P" worktree remove --force "$WT"
+printf '{"acme/my-web-app":{"roots":["%s"],"code_re":"^src/","verify":"true","requires":"no\\\"pe"}}' "$PR" > "$HOME/.claude/stop-verify.projects.json"
+run_hook >"$T/out" 2>&1; jq -e .systemMessage "$T/out" >/dev/null && ok "hook: messages stay valid JSON with quotes in config" || bad "hook: invalid JSON message"
 conf "kill -9 \$\$"; expect_rc 2 "hook: signal death is a failure" run_hook
 A="$T/attacker"; mkdir -p "$A/src"; git -C "$A" init -q; git -C "$A" remote add origin git@example.com:attacker/my-web-app.git
 echo x > "$A/src/a.ts"; AR="$(cd "$A" && pwd -P)"
@@ -137,6 +155,24 @@ mkdir -p "$G/src/gen"; for i in $(seq 1 1500); do echo x > "$G/src/gen/file-with
 expect_rc 2 "guard: still blocks with 1500 new code files (no SIGPIPE skip)" ginput g5
 rm -r "$G/src/gen"
 git -C "$G" checkout -q tests/a.test.ts
+# guard runs before the pass cache, even when code_re does not cover tests
+printf '{"acme/guarded":{"roots":["%s"],"code_re":"^src/","tests_re":"^tests/","verify":"true","limit":120}}' "$GR" > "$HOME/.claude/stop-verify.projects.json"; rm -rf "$HOME/.claude/state"
+echo b2 >> "$G/src/a.ts"; expect_rc 0 "guard: code change passes first" ginput g6
+echo weaker > "$G/tests/a.test.ts"; expect_rc 2 "guard: weakening a test after a pass is still blocked" ginput g6
+git -C "$G" checkout -q tests/a.test.ts
+git -C "$G" update-index --skip-worktree tests/a.test.ts; echo weaker > "$G/tests/a.test.ts"
+expect_rc 2 "guard: test hidden with skip-worktree is still blocked" ginput g7
+git -C "$G" update-index --no-skip-worktree tests/a.test.ts; git -C "$G" checkout -q tests/a.test.ts src/a.ts
+# file names with quotes are fingerprinted
+printf '{"acme/guarded":{"roots":["%s"],"code_re":"^src/","verify":"! grep -rq bad src","limit":120}}' "$GR" > "$HOME/.claude/stop-verify.projects.json"; rm -rf "$HOME/.claude/state"
+echo ok > "$G/src/q\"x.ts"; expect_rc 0 "hook: file with a quote in its name passes" ginput q1
+echo bad > "$G/src/q\"x.ts"; expect_rc 2 "hook: breaking that file is caught (no stale pass)" ginput q1
+rm "$G/src/q\"x.ts"
+# a very long change list goes through VERIFY_CHANGED_FILE
+printf '{"acme/guarded":{"roots":["%s"],"code_re":"^src/","verify":"test -s \\"$VERIFY_CHANGED_FILE\\" && test -z \\"$VERIFY_CHANGED\\" && [ $(wc -l < \\"$VERIFY_CHANGED_FILE\\") -ge 3000 ]","limit":120}}' "$GR" > "$HOME/.claude/stop-verify.projects.json"; rm -rf "$HOME/.claude/state"
+mkdir -p "$G/src/many"; for i in $(seq 1 3000); do : > "$G/src/many/a-rather-long-generated-file-name-number-$i.ts"; done
+expect_rc 0 "hook: 3000 changed files go through VERIFY_CHANGED_FILE (no E2BIG)" ginput big
+rm -r "$G/src/many"
 
 # evidence
 E="$ROOT/tools/verify-evidence.sh"
@@ -146,10 +182,12 @@ expect_rc 64 "evidence: dirty tree refused" in_g -- true
 git -C "$G" checkout -q src/a.ts
 printf '.scratch/\n' > "$G/.gitignore"; git -C "$G" add .gitignore; git -C "$G" -c user.email=t@t -c user.name=t commit -qm ignore
 expect_rc 0 "evidence: passing command" in_g -- true
-LOGF="$(sed -n 's/^- Full log: `\([^`]*\)` (sha256 `[0-9a-f]*`)$/\1/p' "$T/out")"; HSH="$(sed -n 's/^- Full log: `[^`]*` (sha256 `\([0-9a-f]*\)`)$/\1/p' "$T/out")"
+LOGF="$HOME/.local/state/verify-evidence/$(sed -n 's/^- Full log: kept on this machine as `\([^`]*\)` (sha256 `[0-9a-f]*`)$/\1/p' "$T/out")"; HSH="$(sed -n 's/^- Full log: .*(sha256 `\([0-9a-f]*\)`)$/\1/p' "$T/out")"
+grep -q "$HOME" "$T/out" && bad "evidence: prints a local path" || ok "evidence: prints no local path"
+grep -q 'Last' "$T/out" && bad "evidence: prints log text by default" || ok "evidence: no log text unless --tail"
 grep -q "$(git -C "$G" rev-parse HEAD)" "$T/out" && [[ -f "$LOGF" && "$(shasum -a 256 "$LOGF" | cut -d' ' -f1)" == "$HSH" ]] && ok "evidence: names the commit; log hash matches the file" || bad "evidence: commit or hash"
 [[ -z "$(git -C "$G" status --porcelain)" ]] && ok "evidence: log is written outside the work tree" || bad "evidence: dirtied the tree"
-expect_rc 3 "evidence: tree changed during run -> exit 3 INVALID" in_g -- touch src/during.ts
+expect_rc 90 "evidence: tree changed during run -> exit 90 INVALID" in_g -- touch src/during.ts
 grep -q INVALID "$T/out" && ok "evidence: says INVALID" || bad "evidence: INVALID label"
 rm -f "$G/src/during.ts"
 expect_rc 0 "evidence: one quoted string runs as a shell command" in_g -- 'true && echo compound-ok'
@@ -160,8 +198,15 @@ echo t2 > "$G/tests/b.test.ts"; git -C "$G" add -A; git -C "$G" -c user.email=t@
 echo weaker > "$G/tests/b.test.ts"; git -C "$G" -c user.email=t@t -c user.name=t commit -qam "weaken test"
 expect_rc 0 "evidence: run with base" in_g --tests-re '^tests/' --base "$(git -C "$G" rev-list --max-parents=0 HEAD)" -- true
 grep -q 'tests/b.test.ts' "$T/out" && ok "evidence: add-then-weaken inside the branch is reported" || bad "evidence: missed weakened test"
-expect_rc 0 "evidence: bad base" in_g --tests-re '^tests/' --base no-such-ref -- true
+expect_rc 90 "evidence: bad base -> INVALID" in_g --tests-re '^tests/' --base no-such-ref -- true
 grep -q UNKNOWN "$T/out" && ok "evidence: bad base reports UNKNOWN" || bad "evidence: bad base"
+expect_rc 90 "evidence: base that already contains HEAD -> UNKNOWN, INVALID" in_g --tests-re '^tests/' --base HEAD -- true
+grep -q 'already contains HEAD' "$T/out" && ok "evidence: says the base is wrong" || bad "evidence: base==HEAD"
+expect_rc 0 "evidence: --tail shows the log end" in_g --tail 5 -- echo tail-line
+grep -q tail-line "$T/out" && ok "evidence: tail printed on request" || bad "evidence: --tail"
+git -C "$G" update-index --skip-worktree "$(git -C "$G" ls-files tests | head -1)"
+expect_rc 64 "evidence: skip-worktree files refused" in_g -- true
+git -C "$G" update-index --no-skip-worktree "$(git -C "$G" ls-files tests | head -1)"
 expect_rc 1 "evidence: failing command keeps exit code" in_g -- false
 grep -q FAIL "$T/out" && ok "evidence: says FAIL" || bad "evidence: FAIL label"
 

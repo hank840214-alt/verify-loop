@@ -13,8 +13,8 @@ If you build software by talking to Claude Code, Codex or Gemini CLI, you cannot
 | `skills/verify-loop` | Say "verify". The model picks a mode: **start** (agree on 3–5 checkpoints first), **setup** (audit a repo's guardrails), **map** (feature map + a CLI that drives the real app), **triage** (turn a mistake into a check), **done** (evidence, blast radius, risk-tiered review). |
 | `skills/debug` | Say "debug". The model routes: ordinary bug, performance, state/timing, or blast radius. |
 | `hooks/stop-verify.sh` | A Stop hook. When the agent tries to finish in a registered repo with changed code, it runs that repo's checks. Fail or timeout → `exit 2`, the agent must keep working (max 3 blocks). With `tests_re` set, it also blocks a change that edits code and existing tests together; it sees uncommitted edits only (committed test edits are listed by `verify-evidence.sh` for the reviewer). Its own errors never trap the session. |
-| `tools/codex-dispatch.sh` | Runs `codex exec` with an allowlist of flags only: read-only or workspace-write, network off by default for the commands Codex runs (the prompt and images still go to the model service; the caller can pass `--net`), no user config (no MCP servers, no notify hooks), the report file only under `<repo>/.scratch/` or a temp folder. |
-| `tools/verify-evidence.sh` | Runs a check and prints a Markdown evidence block tied to the commit: SHA, command, exit code, log hash, and whether existing tests changed. Refuses a dirty tree; exits 3 if the tree changes during the run. Local evidence helps a reviewer; the real gate is CI rerunning on that SHA. |
+| `tools/codex-dispatch.sh` | Runs `codex exec` with an allowlist of flags only: read-only or workspace-write, network off by default for the commands Codex runs (the prompt and images still go to the model service; the caller can pass `--net`), no user config (no MCP servers, no notify hooks), workspace-write only in the current repo (or repos you list), the report file only under `<repo>/.scratch/` or `/tmp`. |
+| `tools/verify-evidence.sh` | Runs a check and prints a Markdown evidence block tied to the commit: SHA, command, exit code, log hash, and whether existing tests changed. Refuses a dirty tree; exits 90 (INVALID) if the tree changes during the run or test edits cannot be checked. It prints no log text or local path unless you pass `--tail N`. Local evidence helps a reviewer; the real gate is CI rerunning on that SHA. |
 | `docs/METHOD.md` | The method in one page. |
 
 ## Install
@@ -47,7 +47,7 @@ Try it without running anything (from a clone of this repo, inside your project 
 ```
 printf '{"cwd":"%s","session_id":"t"}' "$PWD" | STOP_VERIFY_DRY=1 bash /path/to/verify-loop/hooks/stop-verify.sh
 ```
-It prints `[dry] ...` when your project is registered and has changed files; If the repo is registered but this checkout is not in `roots`, it prints the real path to add (use the `pwd -P` form; `/tmp` is `/private/tmp` on macOS). No output means "not registered" or "nothing changed".
+It prints `[dry] ...` when your project is registered and has changed files; It prints `[dry] ... no changed files` when nothing changed. If the repo is registered but this checkout is not in `roots`, the hook always says so and prints the real path to add (the `pwd -P` form; `/tmp` is `/private/tmp` on macOS). Linked worktrees of a listed checkout are trusted. No output means the repo is not registered. The session's folder must be inside the repo.
 
 ### Codex dispatch
 ```
@@ -55,7 +55,7 @@ tools/codex-dispatch.sh -f task.md -s workspace-write -C /path/to/repo -o /path/
 # -o must be a new .md/.txt file under <repo>/.scratch/ or /tmp
 DRY_RUN=1 tools/codex-dispatch.sh ...   # print the command only
 ```
-Then deny direct `codex` calls so agents are steered to the wrapper. See `examples/settings.snippet.json`. Copy the wrapper to a stable path first; the plugin's own folder changes on every update.
+Then deny direct `codex` calls so agents are steered to the wrapper. See `examples/settings.snippet.json`. Copy the wrapper to a stable path first; the plugin's own folder changes on every update. With `-s workspace-write`, `-C` must be the repo of the folder you run it from; to allow another repo, add its path to `~/.config/codex-dispatch/repos`.
 
 ## Requirements
 macOS or Linux, `bash`, `jq`, `perl`, `git`, `shasum`. Codex CLI for the dispatch script. Tested with Claude Code 2.1.326 and Codex CLI 0.164.0.
@@ -66,12 +66,14 @@ bash tests/run.sh
 ```
 
 ## Limits — read these
-- The Stop hook runs your test command with your user's permissions, outside Claude Code's sandbox. The agent can edit `package.json` or the tests, and the hook will then run them. Only register repos you trust, and review changes to test scripts.
+- The Stop hook runs your test command with your user's permissions, outside Claude Code's sandbox. The agent can edit `package.json` or the tests, and the hook will then run them. Trust is by path: if you check out someone else's branch or PR in a listed checkout, the hook runs that branch's test scripts as you. Only register checkouts where you run code you trust, review changes to test scripts, and use a separate clone (not in `roots`) for outside PRs. To isolate the run, make `verify` start a container or VM yourself.
 - The hook fires whenever a registered repo has changed code, including your own unfinished work. Claude is told to stop, not edit, when the failures are not from its session, but it may still try.
 - Codex in read-only mode can still read any file your user can read. The wrapper limits writes and network, not reads.
+- "Network off" is a Codex setting the wrapper passes (`sandbox_workspace_write.network_access=false`); the tests check the flag, not real traffic. Check it once on your Codex version.
+- Evidence blocks are meant for PRs. They show no log text unless you pass `--tail N`; read the tail before you post it publicly.
 - Deny rules steer agents away from calling `codex` directly; they are not a sandbox.
 - `excludedCommands` is a convenience, not a security boundary.
-- This is a workflow, not a guarantee. It reduces how often you must read code; it does not make reading code unnecessary for high-risk changes.
+- This is a workflow, not a guarantee. High-risk changes (money, login, deleting data) need two independent AI reviews and a way to roll back; if someone who reads code is available, have them look too.
 
 ## License
 MIT. Inspired by talks from Lydia Hallie and Lauren Tan, with some skill steps adapted from Lauren Tan's MIT-licensed pstack; not affiliated with or endorsed by them. See [CREDITS](CREDITS.md).

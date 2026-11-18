@@ -25,7 +25,7 @@ Pick the mode from the conversation without asking: a multi-step task is startin
    - CI runs the same tests.
    - The Stop hook covers this repo (`~/.claude/stop-verify.projects.json`), its `code_re` includes every file type the tests read, and `limit` ≥ 1.5× the measured time and < 540 s. A verify command that touches a database must point at a throwaway one and check that it does.
    - Deny rules cover this project's secrets (including backup copies outside the repo). Sandbox on where possible; `excludedCommands` lists no agent launchers, `osascript *` or `docker *`.
-   - Codex goes through `${CLAUDE_PLUGIN_ROOT}/tools/codex-dispatch.sh`.
+   - Codex goes through the `codex-dispatch.sh` wrapper at the stable path the user set up (see README); the bundled copy is `${CLAUDE_PLUGIN_ROOT}/tools/codex-dispatch.sh`.
    - Lint exists (missing lint is the first gap). Folder boundaries / import bans exist.
    - `AGENTS.md` permissions section, `DESIGN.md`, a feature map, a findings ledger.
    - Up to 3 state/timing flows or invariant-heavy algorithms as formal-verification candidates, and any existing `*.tla`/`*.lean`. List only.
@@ -42,7 +42,7 @@ Pick the mode from the conversation without asking: a multi-step task is startin
 Answer the five questions in `${CLAUDE_PLUGIN_ROOT}/docs/METHOD.md` §1 in order, one line of reasoning each. For "a machine can tell", walk the correction tree (redesign → type → lint with the fix in its message → test → app-driving step) and stop at the first rung that works. Lint exceptions need a reason, an expiry date and an approver. Tests check behaviour: they should survive a refactor of the internals. Prove the check fails on the real past mistake and passes without it; attach both outputs. State/timing bugs → a TLA+ model locked in as a repo check, with a statechart. Pure invariants → consider Lean. List any old text rule this replaces as "can delete", for the user to approve.
 
 ## done — before handing over
-1. Commit, then run the checks through `${CLAUDE_PLUGIN_ROOT}/tools/verify-evidence.sh --tests-re '<test paths>' -- <verify command>`. Paste its output unchanged into the PR's Verification section; never write that section by hand. Red means not done. If it lists changed existing tests, another agent or the user must approve that part.
+1. Commit, then run the checks through `${CLAUDE_PLUGIN_ROOT}/tools/verify-evidence.sh --tests-re '<test paths>' -- <verify command>`. Paste its output unchanged into the PR's Verification section; never write that section by hand. Add `--tail N` only after reading the log for paths or secrets. Red means not done. If it lists changed existing tests, another agent or the user must approve that part.
 2. Produce artifacts: UI change → before/after screenshots or a short video; flow/state change → a statechart (rerun the model if one exists); bug fix → failing repro before, passing after. Name things by the feature map.
 3. Blast radius, even for small changes: list callers and shared data (file:line), write "this is safe because ___", prove that one fact by running real code.
 4. PR body, in order: Why | What changed | Scope | Tradeoffs | Blast radius | Verification (commands + output). Conventional Commits title. Never merge from here.

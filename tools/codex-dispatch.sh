@@ -18,10 +18,14 @@
 #     unless -m / -c model_reasoning_effort= is given, so Codex keeps its own choice.
 #   - Network is off unless --net (workspace-write only).
 #   - -C: needs a git toplevel unless read-only + --skip-git-repo-check; never $HOME or /.
+#     workspace-write: -C must be the repo of the current folder, or a repo listed (one
+#     path per line) in ~/.config/codex-dispatch/repos; never a repo
+#     that contains a protected folder. $HOME comes from the user database.
 #   - -C and -o are refused inside this script's repo, ~/.claude and ~/.codex (any mode).
 #   - -o: a NEW .md/.txt file, not a symlink, under <-C>/.scratch/ (itself not a symlink)
-#     or /tmp. Codex writes into a private temp folder; this script then creates -o
-#     exclusively, so a file swapped in meanwhile is never overwritten.
+#     or /tmp. Codex writes into a folder under ~/.local/state; this script then
+#     re-checks the target folder and creates -o exclusively inside it. If -o was given
+#     and Codex wrote no report, the exit code is non-zero.
 #   - Note: read-only Codex can still READ any file your user can read, and the prompt
 #     file and -i images are sent to the model service. "Network off" applies to the
 #     commands Codex runs, not to the model call itself.
@@ -62,22 +66,37 @@ case "$mode" in
 esac
 [[ -n "$dir" ]] || die "-C <dir> is required" 64
 rdir="$(real "$dir")" || die "-C $dir does not exist" 64
+# Protect both $HOME and the home from the user database, so HOME=/elsewhere cannot
+# move the protected folders.
 home="$(real "$HOME")"
-[[ "$rdir" != "/" && "$rdir" != "$home" ]] || die "-C cannot be / or your home folder"
+pwhome="$(perl -e 'print((getpwuid($<))[7])' 2>/dev/null || true)"; pwhome="$(real "${pwhome:-$HOME}" || echo "$home")"
+[[ "$rdir" != "/" && "$rdir" != "$home" && "$rdir" != "$pwhome" ]] || die "-C cannot be / or your home folder"
 if ((skip)); then
   [[ "$mode" == read-only ]] || die "--skip-git-repo-check is only allowed with read-only"
 else
   top="$(git -C "$rdir" rev-parse --show-toplevel 2>/dev/null)" || die "-C must be inside a git repo (or use read-only + --skip-git-repo-check)"
-  [[ "$(real "$top")" != "$home" ]] || die "-C repo cannot be your home folder"
+  rtop="$(real "$top")"
+  [[ "$(real "$top")" != "$home" && "$(real "$top")" != "$pwhome" ]] || die "-C repo cannot be your home folder"
 fi
 protected=()
 selfrepo="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null || true)"
 selfdir="$(real "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null || true)"
-for p in "$selfrepo" "$selfdir" "$home/.claude" "$home/.codex"; do
+for p in "$selfrepo" "$selfdir" "$home/.claude" "$home/.codex" "$pwhome/.claude" "$pwhome/.codex"; do
   [[ -n "$p" ]] || continue; rp="$(real "$p" 2>/dev/null)" || continue; protected+=("$rp")
 done
 inside_protected() { local x="$1" p; for p in ${protected[@]+"${protected[@]}"}; do [[ "$x" == "$p" || "$x" == "$p"/* ]] && return 0; done; return 1; }
 inside_protected "$rdir" && die "-C cannot be inside this tool's repo, ~/.claude or ~/.codex"
+if [[ "$mode" == workspace-write ]]; then
+  # Codex may only write the repo you are working in, or one you listed on purpose.
+  here="$(git rev-parse --show-toplevel 2>/dev/null || true)"; [[ -n "$here" ]] && here="$(real "$here")"
+  allow="$pwhome/.config/codex-dispatch/repos"   # not $HOME or $XDG_*: the caller controls those
+  listed=0
+  if [[ -f "$allow" ]]; then
+    while IFS= read -r line; do [[ -n "$line" && "$(real "$line" 2>/dev/null)" == "$rtop" ]] && listed=1; done < "$allow"
+  fi
+  [[ "$rtop" == "$here" ]] || ((listed)) || die "workspace-write -C must be the repo of the current folder, or listed in $allow"
+  for p in ${protected[@]+"${protected[@]}"}; do [[ "$p" == "$rtop"/* ]] && die "-C repo contains a protected folder ($p)"; done
+fi
 if ((net)) && [[ "$mode" != workspace-write ]]; then die "--net is only allowed with workspace-write"; fi
 
 if [[ -n "$out" ]]; then
@@ -117,7 +136,7 @@ if ((net)); then final+=(-c sandbox_workspace_write.network_access=true); else f
 # Before delivery this script re-checks the target folder and creates the real file
 # exclusively (noclobber), never following a link that appeared in the meantime.
 if [[ -n "$out" ]]; then
-  sbase="${XDG_STATE_HOME:-$home/.local/state}/codex-dispatch"
+  sbase="$pwhome/.local/state/codex-dispatch"   # not $HOME or $TMPDIR: the caller controls those
   mkdir -p "$sbase" && chmod 700 "$sbase" || die "cannot create $sbase" 70
   rsbase="$(real "$sbase")" || die "cannot resolve $sbase" 70
   [[ "$rsbase" == "$rdir" || "$rsbase" == "$rdir"/* ]] && die "the staging folder $rsbase is inside the -C repo; set XDG_STATE_HOME elsewhere" 70
@@ -139,7 +158,11 @@ if [[ -e "$msg" || -L "$msg" ]]; then
   [[ -L "$rdir/.scratch" ]] && die "<-C>/.scratch became a symlink while Codex ran; report left unsaved" 73
   [[ "$(real "$(dirname "$out")" 2>/dev/null)" == "$rodir" ]] || die "the -o folder moved while Codex ran; report left unsaved" 73
   inside_protected "$rodir" && die "-o folder is now inside a protected folder; report left unsaved" 73
-  [[ -L "$out" || -e "$out" ]] && die "-o target appeared while Codex ran; report left unsaved" 73
-  ( set -C; cat < "$msg" > "$out" ) || die "could not create $out" 73
+  # Write through the directory we just checked: cd into it, confirm where we are,
+  # then create the file relative to that folder, so a swapped path cannot redirect it.
+  ( cd -P -- "$rodir" 2>/dev/null && [[ "$(pwd -P)" == "$rodir" ]] && ! inside_protected "$(pwd -P)" \
+      && set -C && cat < "$msg" > "./$(basename "$out")" ) || die "could not create $out (folder changed or file exists); report left unsaved" 73
+elif [[ -n "$out" ]]; then
+  echo "codex-dispatch: Codex wrote no report" >&2; ((rc)) || rc=74
 fi
 exit "$rc"
