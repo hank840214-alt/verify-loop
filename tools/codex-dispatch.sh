@@ -84,7 +84,10 @@ selfdir="$(real "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null || true)"
 for p in "$selfrepo" "$selfdir" "$home/.claude" "$home/.codex" "$pwhome/.claude" "$pwhome/.codex"; do
   [[ -n "$p" ]] || continue; rp="$(real "$p" 2>/dev/null)" || continue; protected+=("$rp")
 done
-inside_protected() { local x="$1" p; for p in ${protected[@]+"${protected[@]}"}; do [[ "$x" == "$p" || "$x" == "$p"/* ]] && return 0; done; return 1; }
+# Compared lower-case: macOS file systems usually ignore case, so ~/.CLAUDE is ~/.claude.
+lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+inside_protected() { local x p; x="$(lc "$1")"; for p in ${protected[@]+"${protected[@]}"}; do p="$(lc "$p")"; [[ "$x" == "$p" || "$x" == "$p"/* ]] && return 0; done; return 1; }
+contains_protected() { local x p; x="$(lc "$1")"; for p in ${protected[@]+"${protected[@]}"}; do p="$(lc "$p")"; [[ "$p" == "$x"/* ]] && return 0; done; return 1; }
 inside_protected "$rdir" && die "-C cannot be inside this tool's repo, ~/.claude or ~/.codex"
 if [[ "$mode" == workspace-write ]]; then
   # Codex may only write the repo you are working in, or one you listed on purpose.
@@ -95,7 +98,7 @@ if [[ "$mode" == workspace-write ]]; then
     while IFS= read -r line; do [[ -n "$line" && "$(real "$line" 2>/dev/null)" == "$rtop" ]] && listed=1; done < "$allow"
   fi
   [[ "$rtop" == "$here" ]] || ((listed)) || die "workspace-write -C must be the repo of the current folder, or listed in $allow"
-  for p in ${protected[@]+"${protected[@]}"}; do [[ "$p" == "$rtop"/* ]] && die "-C repo contains a protected folder ($p)"; done
+  contains_protected "$rtop" && die "-C repo contains a protected folder"
 fi
 if ((net)) && [[ "$mode" != workspace-write ]]; then die "--net is only allowed with workspace-write"; fi
 
@@ -150,8 +153,18 @@ if [[ "${DRY_RUN:-0}" == 1 ]]; then
   [[ -n "$out" ]] && printf 'then copy to %q (exclusive create)\n' "$out"
   exit 0
 fi
-[[ -n "$out" ]] || exec codex exec "${final[@]}" - < "$prompt_file"
-rc=0; codex exec "${final[@]}" - < "$prompt_file" || rc=$?
+# This script runs outside Claude's sandbox, so `codex` must not come from a folder an
+# agent can write: the -C repo or the current repo (e.g. node_modules/.bin). Keep other
+# agent-writable folders off PATH.
+[[ -n "${here:-}" ]] || here="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+cbin="$(command -v codex)" || die "codex not found on PATH" 69
+cdir="$(real "$(dirname "$cbin")")" || die "cannot resolve the codex folder" 69
+for w in "$rdir" "$here"; do
+  [[ -n "$w" ]] || continue; wr="$(real "$w" 2>/dev/null)" || continue
+  [[ "$(lc "$cdir")" == "$(lc "$wr")" || "$(lc "$cdir")" == "$(lc "$wr")"/* ]] && die "refusing to run codex from $cdir (a folder agents can write)"
+done
+[[ -n "$out" ]] || exec "$cbin" exec "${final[@]}" - < "$prompt_file"
+rc=0; "$cbin" exec "${final[@]}" - < "$prompt_file" || rc=$?
 msg="$stage/last-message.md"
 if [[ -e "$msg" || -L "$msg" ]]; then
   [[ -L "$msg" || ! -f "$msg" ]] && die "the staged report is not a plain file; report left unsaved" 73
@@ -160,8 +173,12 @@ if [[ -e "$msg" || -L "$msg" ]]; then
   inside_protected "$rodir" && die "-o folder is now inside a protected folder; report left unsaved" 73
   # Write through the directory we just checked: cd into it, confirm where we are,
   # then create the file relative to that folder, so a swapped path cannot redirect it.
+  # Exclusive create (O_EXCL|O_NOFOLLOW): fails on any existing name, including a link or FIFO.
   ( cd -P -- "$rodir" 2>/dev/null && [[ "$(pwd -P)" == "$rodir" ]] && ! inside_protected "$(pwd -P)" \
-      && set -C && cat < "$msg" > "./$(basename "$out")" ) || die "could not create $out (folder changed or file exists); report left unsaved" 73
+      && perl -e 'use Fcntl; sysopen(my $o, $ARGV[0], O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW, 0644) or exit 1;
+                  open(my $i, "<", $ARGV[1]) or exit 1; local $/; my $d = <$i>; $d = "" unless defined $d;
+                  print {$o} $d or exit 1; close($o) or exit 1' "./$(basename "$out")" "$msg" ) \
+    || die "could not create $out (folder changed or name exists); report left unsaved" 73
 elif [[ -n "$out" ]]; then
   echo "codex-dispatch: Codex wrote no report" >&2; ((rc)) || rc=74
 fi

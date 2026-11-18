@@ -76,7 +76,8 @@ run_limited() {  # seconds, command...  -> exit 124 on time limit, kills the who
 re_ok() { [[ -z "$1" ]] && return 0; [[ "" =~ $1 ]]; [[ $? -le 1 ]]; }
 
 # NUL-separated, so tabs, quotes and newlines in file names are never mangled.
-uncommitted_z() { git diff -z --name-only HEAD 2>/dev/null; git ls-files -z --others --exclude-standard 2>/dev/null; }
+# --no-renames: a moved file shows its old path too, so moving code out of code_re still counts.
+uncommitted_z() { git diff -z --no-renames --name-only HEAD && git ls-files -z --others --exclude-standard; }
 
 verify_root() {
   local ROOT="$1" KEY="$2"
@@ -93,11 +94,16 @@ verify_root() {
   [[ -n "$BASE" ]] || { git rev-parse -q --verify origin/main >/dev/null && BASE=origin/main; }
   [[ -n "$BASE" ]] || { git rev-parse -q --verify origin/master >/dev/null && BASE=origin/master; }
 
-  local f CODE=() TESTF=() UNC_CODE=0
+  local f CODE=() TESTF=() UNC_CODE=0 LZ
+  LZ="$(mktemp "${TMPDIR:-/tmp}/stop-verify-z.XXXXXX")" || note "mktemp failed; verification skipped"
+  if ! { uncommitted_z && { [[ -z "$BASE" ]] || git diff -z --no-renames --name-only "$BASE"...HEAD; }; } >"$LZ" 2>/dev/null; then
+    rm -f "$LZ"; msg "$KEY: git could not list the changed files; checks NOT run"; return 0
+  fi
   while IFS= read -r -d '' f; do
     [[ "$f" =~ $CODE_RE ]] && CODE+=("$f")
     [[ -n "$TESTS_RE" && "$f" =~ $TESTS_RE ]] && TESTF+=("$f")
-  done < <( { uncommitted_z; [[ -n "$BASE" ]] && git diff -z --name-only "$BASE"...HEAD 2>/dev/null; } | sort -zu )
+  done < <(sort -zu "$LZ")
+  rm -f "$LZ"
   if (( ${#CODE[@]} == 0 )); then
     [[ "${STOP_VERIFY_DRY:-0}" == 1 ]] && echo "[dry] $KEY: no changed files match code_re (base: ${BASE:-none})" >&2
     return 0
@@ -113,14 +119,19 @@ verify_root() {
   # existing tests that judge it. Uncommitted edits only; committed test edits are
   # listed by verify-evidence.sh for the PR reviewer.
   if [[ -n "$TESTS_RE" ]]; then
-    local st old TAMPER=() e tag
+    local st old TAMPER=() e tag NS
+    NS="$(mktemp "${TMPDIR:-/tmp}/stop-verify-ns.XXXXXX")" || note "mktemp failed; verification skipped"
+    if ! git diff -z --no-renames --name-status HEAD >"$NS" 2>/dev/null || ! uncommitted_z >/dev/null 2>&1; then
+      rm -f "$NS"; msg "$KEY: git could not list edited tests; checks NOT run"; return 0
+    fi
     while IFS= read -r -d '' st; do
       case "$st" in
         R*|C*) IFS= read -r -d '' old; IFS= read -r -d '' f; f="$old" ;;
         *) IFS= read -r -d '' f ;;
       esac
       case "$st" in M*|D*|R*|T*) [[ "$f" =~ $TESTS_RE ]] && TAMPER+=("$f") ;; esac
-    done < <(git diff -z --name-status HEAD 2>/dev/null)
+    done < "$NS"
+    rm -f "$NS"
     # Files hidden from git status (skip-worktree / assume-unchanged) count as edited.
     while IFS= read -r -d '' e; do
       tag="${e%% *}"; f="${e#* }"
@@ -128,7 +139,7 @@ verify_root() {
     done < <(git ls-files -z -v 2>/dev/null)
     while IFS= read -r -d '' f; do
       [[ "$f" =~ $CODE_RE && ! "$f" =~ $TESTS_RE ]] && { UNC_CODE=1; break; }
-    done < <(uncommitted_z)
+    done < <(uncommitted_z 2>/dev/null)
     if (( ${#TAMPER[@]} > 0 && UNC_CODE )); then
       if [[ "${STOP_VERIFY_DRY:-0}" == 1 ]]; then echo "[dry] $KEY: test guard would block: ${TAMPER[*]}" >&2; return 0; fi
       if (( BLOCKS >= MAX_BLOCKS )); then
@@ -209,7 +220,17 @@ in_roots() { [[ -n "$1" ]] && jq -e --arg k "$KEY" --arg r "$1" '(.[$k].roots //
 RROOT="$(cd "$ROOT" && pwd -P)"
 COMMON="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
 MAIN="$( [[ -n "$COMMON" ]] && cd "$COMMON/.." 2>/dev/null && pwd -P)"
-if ! in_roots "$RROOT" && ! in_roots "$MAIN"; then
+# A worktree counts only if the trusted checkout itself lists it (a crafted .git file is not enough).
+trusted_worktree() {
+  [[ -n "$MAIN" && "$MAIN" != "$RROOT" ]] && in_roots "$MAIN" || return 1
+  local line p
+  while IFS= read -r line; do
+    [[ "$line" == "worktree "* ]] || continue
+    p="$(cd "${line#worktree }" 2>/dev/null && pwd -P)" && [[ "$p" == "$RROOT" ]] && return 0
+  done < <(git -C "$MAIN" worktree list --porcelain 2>/dev/null)
+  return 1
+}
+if ! in_roots "$RROOT" && ! trusted_worktree; then
   if jq -e --arg k "$KEY" '.[$k].roots' "$CONF" >/dev/null 2>&1; then
     msg "$KEY: this checkout is not in roots, so its checks are not run. To trust it, add its real path to roots: $RROOT"
   else

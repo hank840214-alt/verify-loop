@@ -17,7 +17,9 @@ set -uo pipefail
 die() { echo "verify-evidence: $1" >&2; exit "${2:-64}"; }
 sha256() { if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1"; else sha256sum "$1"; fi | cut -d' ' -f1; }
 dirty() { local s; s="$(git status --porcelain --untracked-files=normal)" || return 0; [[ -n "$s" ]]; }
-hidden() { git ls-files -v | grep -q '^[a-zS]'; }   # skip-worktree / assume-unchanged hide edits from git status
+# skip-worktree / assume-unchanged hide edits from git status. Read the whole list
+# (no grep -q under pipefail) and treat a git failure as "hidden".
+hidden() { local l; l="$(git ls-files -v)" || return 0; grep '^[a-zS]' <<<"$l" >/dev/null; }
 
 tests_re="" base="" tail_n=0 logdir="${XDG_STATE_HOME:-$HOME/.local/state}/verify-evidence"
 while (($#)); do
@@ -74,13 +76,21 @@ if [[ -n "$tests_re" ]]; then
     echo "- Existing tests changed: **UNKNOWN** (no valid base; pass --base)"; valid=0
   elif [[ "$mb" == "$sha" ]]; then
     echo "- Existing tests changed: **UNKNOWN** (base \`$base\` already contains HEAD; pass the base the change started from)"; valid=0
-  elif ! ns="$(git -c core.quotePath=false diff --name-status "$mb" HEAD)"; then
-    echo "- Existing tests changed: **UNKNOWN** (diff failed)"; valid=0
+  elif ! nsz="$(mktemp "$logdir/ns.XXXXXX")" || ! { git diff -z --no-renames --name-status "$mb" HEAD \
+           && git log -z --no-renames --format= --name-status "$mb"..HEAD; } >"$nsz" 2>/dev/null; then
+    echo "- Existing tests changed: **UNKNOWN** (git diff/log failed)"; valid=0; rm -f "${nsz:-}"
   else
     # Net change vs base, plus any commit in the branch that modified a test file
-    # (catches "add a test, then weaken it" inside the same PR).
-    touched="$( { printf '%s\n' "$ns"; git -c core.quotePath=false log --format= --name-status "$mb"..HEAD; } \
-      | awk -F'\t' '$1 ~ /^(M|D|R|T)/ {print $2}' | grep -E -- "$tests_re" | sort -u || true)"
+    # (catches "add a test, then weaken it" inside the same PR). NUL-separated, so
+    # unusual file names are read exactly.
+    touched=""
+    while IFS= read -r -d '' st; do
+      st="${st#$'\n'}"; [[ -n "$st" ]] || continue
+      IFS= read -r -d '' f || break
+      case "$st" in M*|D*|T*) [[ "$f" =~ $tests_re ]] && touched+="$f"$'\n' ;; esac
+    done < "$nsz"
+    rm -f "$nsz"
+    touched="$(printf '%s' "$touched" | sort -u)"
     if [[ -n "$touched" ]]; then
       echo "- Existing tests changed vs \`$base\` (need an independent reviewer):"
       printf '%s\n' "$touched" | sed 's/^/  - `/; s/$/`/'

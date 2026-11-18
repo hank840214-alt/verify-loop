@@ -72,6 +72,9 @@ cat > "$T/bin/codex" <<FAKE
 o=""; while ((\$#)); do [[ "\$1" == -o ]] && o="\$2"; shift; done
 cat >/dev/null; ln -s "$T/victim.txt" "\$o"; exit 0
 FAKE
+mkdir -p "$REPO/bin"; cp "$T/bin/codex" "$REPO/bin/codex"
+PATH="$REPO/bin:$PATH" expect_rc 65 "dispatch: codex found inside the target repo is refused" bash "$D" -f "$T/task.md" -s read-only -C "$REPO" -o "$REPO/.scratch/pb.md"
+rm -r "$REPO/bin"
 PATH="$T/bin:$PATH" expect_rc 73 "dispatch: staged report that is a symlink is refused" bash "$D" -f "$T/task.md" -s read-only -C "$REPO" -o "$REPO/.scratch/link2.md"
 [[ "$(cat "$T/victim.txt")" == victim && ! -e "$REPO/.scratch/link2.md" ]] && ok "dispatch: nothing written through the link" || bad "dispatch: wrote through staged link"
 cat > "$T/bin/codex" <<FAKE
@@ -84,6 +87,16 @@ PATH="$T/bin:$PATH" expect_rc 73 "dispatch: .scratch swapped for a symlink durin
 rm "$REPO/.scratch"; mv "$T/moved" "$REPO/.scratch"
 DRY_RUN=1 bash "$D" -f "$T/task.md" -s read-only -C "$REPO" -o "$REPO/.scratch/st.md" >"$T/out" 2>&1
 grep -q "$REALHOME/.local/state/codex-dispatch/" "$T/out" && ok "dispatch: staging is in the real home, outside /tmp and TMPDIR" || bad "dispatch: staging location"
+cat > "$T/bin/codex" <<FAKE
+#!/usr/bin/env bash
+o=""; while ((\$#)); do [[ "\$1" == -o ]] && o="\$2"; shift; done; cat >/dev/null; mkfifo "$REPO/.scratch/ff.md"; echo r > "\$o"
+FAKE
+PATH="$T/bin:$PATH" expect_rc 73 "dispatch: a FIFO placed at -o during the run is refused (no hang)" bash "$D" -f "$T/task.md" -s read-only -C "$REPO" -o "$REPO/.scratch/ff.md"
+rm -f "$REPO/.scratch/ff.md"
+mkdir -p "$HOME/.claude/r2"; git -C "$HOME/.claude/r2" init -q
+if [[ -d "$HOME/.CLAUDE" ]]; then
+  DRY_RUN=1 expect_rc 65 "dispatch: -C ~/.CLAUDE (other case) is still protected" bash "$D" -f "$T/task.md" -s read-only -C "$HOME/.CLAUDE/r2"
+else ok "dispatch: case test skipped (case-sensitive file system)"; fi
 cat > "$T/bin/codex" <<'FAKE'
 #!/usr/bin/env bash
 cat >/dev/null; exit 0
@@ -123,9 +136,14 @@ C2="$T/clone2"; git clone -q "$P" "$C2"; git -C "$C2" remote set-url origin http
 conf "exit 1"
 printf '{"cwd":"%s","session_id":"c2"}' "$C2" | bash "$H" >"$T/out" 2>&1; [[ $? == 0 ]] && ok "hook: same owner/repo at an untrusted path -> not run" || bad "hook: ran an untrusted checkout"
 grep -q 'not in roots' "$T/out" && jq -e .systemMessage "$T/out" >/dev/null && ok "hook: says a checkout is missing from roots (valid JSON)" || bad "hook: roots miss is silent"
+X="$T/crafted"; mkdir -p "$X/src"; printf 'gitdir: %s/.git\n' "$P" > "$X/.git"; echo x > "$X/src/a.ts"
+printf '{"cwd":"%s","session_id":"x"}' "$X" | bash "$H" >"$T/out" 2>&1; [[ $? == 0 ]] && grep -q 'not in roots' "$T/out" && ok "hook: a folder with a crafted .git file is not trusted" || bad "hook: trusted a crafted .git file"
 WT="$T/wt"; git -C "$P" worktree add -q "$WT" 2>/dev/null; echo w >> "$WT/src/a.ts"
 printf '{"cwd":"%s","session_id":"wt"}' "$WT" | bash "$H" >"$T/out" 2>&1; [[ $? == 2 ]] && ok "hook: linked worktree of a trusted checkout is checked" || bad "hook: worktree skipped"
 git -C "$P" worktree remove --force "$WT"
+git -C "$P" stash -q 2>/dev/null; rm -rf "$HOME/.claude/state"; mkdir -p "$P/other"; git -C "$P" mv src/a.ts other/a.ts
+run_hook >"$T/out" 2>&1; [[ $? == 2 ]] && ok "hook: moving code out of code_re still runs the checks" || bad "hook: missed a moved file"
+git -C "$P" mv other/a.ts src/a.ts; git -C "$P" stash pop -q 2>/dev/null
 printf '{"acme/my-web-app":{"roots":["%s"],"code_re":"^src/","verify":"true","requires":"no\\\"pe"}}' "$PR" > "$HOME/.claude/stop-verify.projects.json"
 run_hook >"$T/out" 2>&1; jq -e .systemMessage "$T/out" >/dev/null && ok "hook: messages stay valid JSON with quotes in config" || bad "hook: invalid JSON message"
 conf "kill -9 \$\$"; expect_rc 2 "hook: signal death is a failure" run_hook
@@ -190,9 +208,10 @@ grep -q "$(git -C "$G" rev-parse HEAD)" "$T/out" && [[ -f "$LOGF" && "$(shasum -
 expect_rc 90 "evidence: tree changed during run -> exit 90 INVALID" in_g -- touch src/during.ts
 grep -q INVALID "$T/out" && ok "evidence: says INVALID" || bad "evidence: INVALID label"
 rm -f "$G/src/during.ts"
-expect_rc 0 "evidence: one quoted string runs as a shell command" in_g -- 'true && echo compound-ok'
-grep -q compound-ok "$T/out" && ok "evidence: compound command ran fully" || bad "evidence: compound"
-grep -qF 'true && echo compound-ok`' "$T/out" && ok "evidence: shows the command as typed" || bad "evidence: command display"
+export MARK="$T/compound-mark"
+expect_rc 0 "evidence: one quoted string runs as a shell command" in_g -- 'true && touch "$MARK"'
+[[ -f "$MARK" ]] && ok "evidence: second step of a compound command ran" || bad "evidence: compound"
+grep -qF 'true && touch "$MARK"`' "$T/out" && ok "evidence: shows the command as typed" || bad "evidence: command display"
 expect_rc 64 "evidence: --log-dir inside the tree refused" in_g --log-dir .scratch-logs -- true
 echo t2 > "$G/tests/b.test.ts"; git -C "$G" add -A; git -C "$G" -c user.email=t@t -c user.name=t commit -qm "add test"
 echo weaker > "$G/tests/b.test.ts"; git -C "$G" -c user.email=t@t -c user.name=t commit -qam "weaken test"
@@ -202,11 +221,15 @@ expect_rc 90 "evidence: bad base -> INVALID" in_g --tests-re '^tests/' --base no
 grep -q UNKNOWN "$T/out" && ok "evidence: bad base reports UNKNOWN" || bad "evidence: bad base"
 expect_rc 90 "evidence: base that already contains HEAD -> UNKNOWN, INVALID" in_g --tests-re '^tests/' --base HEAD -- true
 grep -q 'already contains HEAD' "$T/out" && ok "evidence: says the base is wrong" || bad "evidence: base==HEAD"
-expect_rc 0 "evidence: --tail shows the log end" in_g --tail 5 -- echo tail-line
-grep -q tail-line "$T/out" && ok "evidence: tail printed on request" || bad "evidence: --tail"
+expect_rc 0 "evidence: --tail shows the log end" in_g --tail 5 -- 'echo tail-$((40+2))'
+sed -n '/<details>/,$p' "$T/out" | grep -q 'tail-42' && ok "evidence: tail printed on request (from the log)" || bad "evidence: --tail"
 git -C "$G" update-index --skip-worktree "$(git -C "$G" ls-files tests | head -1)"
 expect_rc 64 "evidence: skip-worktree files refused" in_g -- true
 git -C "$G" update-index --no-skip-worktree "$(git -C "$G" ls-files tests | head -1)"
+echo q > "$G/tests/q\"x.test.ts"; git -C "$G" add -A; git -C "$G" -c user.email=t@t -c user.name=t commit -qm "quote test"
+QB="$(git -C "$G" rev-parse HEAD)"; echo weaker > "$G/tests/q\"x.test.ts"; git -C "$G" -c user.email=t@t -c user.name=t commit -qam "weaken quote test"
+expect_rc 0 "evidence: run with a quoted test name" in_g --tests-re '^tests/' --base "$QB" -- true
+grep -qF 'tests/q"x.test.ts' "$T/out" && ok "evidence: edited test with a quote in its name is listed" || bad "evidence: missed quoted test name"
 expect_rc 1 "evidence: failing command keeps exit code" in_g -- false
 grep -q FAIL "$T/out" && ok "evidence: says FAIL" || bad "evidence: FAIL label"
 
