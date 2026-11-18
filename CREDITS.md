@@ -7,7 +7,7 @@ This project is inspired by two public talks. It is an independent project. Neit
 
 Several skill steps are adapted from **pstack** (https://github.com/cursor/plugins/tree/main/pstack), Copyright (c) 2026 Lauren Tan, MIT License: the blast-radius check, the seven performance questions, the reproduction standard, the root-cause question and the extended blast-radius list in `skills/debug`; and the decision log and its independent audit, PR body sections, run-as-user verdict, driver `doctor` command and review-finding triage in `skills/verify-loop` (some from pstack's automations/benny skills). The rest of the text and all scripts are original to this project.
 
-The test guard and the commit-bound evidence script came from a reader's comment: "one agent writing both the fix and the test is grading its own exam."
+The test guard and the commit-bound evidence script came from a reader's comment: "one agent writing both the fix and the test is grading its own exam." The CODEOWNERS setup for test folders came from another reader's suggestion.
 
 ## pstack licence
 

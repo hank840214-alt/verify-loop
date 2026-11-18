@@ -57,6 +57,14 @@ DRY_RUN=1 tools/codex-dispatch.sh ...   # print the command only
 ```
 Then deny direct `codex` calls so agents are steered to the wrapper. See `examples/settings.snippet.json`. Copy the wrapper to a stable path first; the plugin's own folder changes on every update. With `-s workspace-write`, `-C` must be the repo of the folder you run it from; to allow another repo, add its path to `~/.config/codex-dispatch/repos`.
 
+### Hard stop on the server: CODEOWNERS for tests
+The Stop hook's test guard runs on your machine and can be bypassed (commit first, then edit the tests). To make test edits impossible to merge without review, let GitHub enforce it:
+1. Copy `examples/CODEOWNERS` to `.github/CODEOWNERS` and set the test paths and the owner.
+2. Turn on branch protection for the default branch with "Require a pull request" and "Require review from Code Owners". Also apply it to administrators.
+3. Let agents push and open PRs from a separate account (a bot account or GitHub App). GitHub does not let an account approve its own PR, so if agents use your account, such a PR can never be approved.
+
+Branch protection is free on public repos; private repos need a paid GitHub plan. If you do not read code, ask a second agent to review the test change and decide on its summary.
+
 ## Requirements
 macOS or Linux, `bash`, `jq`, `perl`, `git`, `shasum`. Codex CLI for the dispatch script. Tested with Claude Code 2.1.326 and Codex CLI 0.164.0.
 

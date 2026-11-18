@@ -1,0 +1,7 @@
+# Copy to .github/CODEOWNERS in your project and change the paths and owner.
+# Any PR that touches these paths then needs a review from the owner, if branch
+# protection on the default branch has "Require review from Code Owners" turned on.
+# The owner must be a different account from the one that opens the PR.
+/tests/       @your-name
+**/*.test.*   @your-name
+**/__tests__/ @your-name

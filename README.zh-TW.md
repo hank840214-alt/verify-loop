@@ -19,6 +19,14 @@
 
 安裝與設定步驟請看 [README.md](README.md)（指令相同）。專案登記的 key 是 `owner/repo`，例如 `alice/shop`；另外必須填 `roots`：你信任的 checkout 絕對路徑。其他位置的 clone（就算同一個 repo）都不會被執行，hook 會提示並印出該補進 `roots` 的實際路徑。信任的 checkout 底下的 linked worktree 也算信任。登記前先請 AI 跑 `/verify-loop setup`，它會讀測試設定，列出會重置資料庫、部署、寄信或打付費 API 的步驟。
 
+## 伺服器端硬擋：用 CODEOWNERS 保護測試
+停止 hook 的測試守衛在你的電腦上跑，可以被繞過（先 commit 再改測試）。要讓「改測試」沒經審核就無法合併，交給 GitHub 擋：
+1. 把 `examples/CODEOWNERS` 複製到 `.github/CODEOWNERS`，改成你的測試路徑和負責人帳號。
+2. 預設分支開啟分支保護，勾選「需要 PR」和「需要 Code Owner 審核」，並套用到管理員。
+3. 讓 AI 用另一個帳號（機器人帳號或 GitHub App）push 和開 PR。GitHub 不准帳號核准自己的 PR；AI 若用你的帳號，這種 PR 永遠無法核准。
+
+公開 repo 可以免費用分支保護；私人 repo 需要付費方案。你不看程式碼的話，請另一個 AI 審這次測試改動，依它的摘要決定。
+
 ## 注意
 - 停止 hook 用你的帳號權限、在 Claude Code 沙盒外跑測試指令；AI 能改 `package.json` 或測試，hook 之後會照跑。信任是看路徑：在登記的資料夾切到別人的分支或 PR，hook 會用你的權限跑那個分支的測試腳本。外部 PR 請用另一份沒登記的 clone；要隔離就讓 `verify` 自己啟動容器或 VM。
 - 只要登記的 repo 有改動（包括你自己沒做完的），hook 就會觸發。失敗不是這個 session 造成時，Claude 被要求說明並停手，但它仍可能去改。
