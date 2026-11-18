@@ -112,11 +112,16 @@ if ((net)); then final+=(-c sandbox_workspace_write.network_access=true); else f
 ((skip)) && final+=(--skip-git-repo-check)
 ((json)) && final+=(--json)
 
-# Codex writes -o outside its sandbox, so it writes into a fresh private folder;
-# this script then creates the real file exclusively (noclobber), never following
-# a file that appeared in the meantime.
+# Codex writes -o outside its sandbox, so it writes into a fresh folder under
+# ~/.local/state (not /tmp or $TMPDIR, which the workspace-write sandbox can write).
+# Before delivery this script re-checks the target folder and creates the real file
+# exclusively (noclobber), never following a link that appeared in the meantime.
 if [[ -n "$out" ]]; then
-  stage="$(mktemp -d "${TMPDIR:-/tmp}/codex-dispatch.XXXXXX")" || die "mktemp failed" 70
+  sbase="${XDG_STATE_HOME:-$home/.local/state}/codex-dispatch"
+  mkdir -p "$sbase" && chmod 700 "$sbase" || die "cannot create $sbase" 70
+  rsbase="$(real "$sbase")" || die "cannot resolve $sbase" 70
+  [[ "$rsbase" == "$rdir" || "$rsbase" == "$rdir"/* ]] && die "the staging folder $rsbase is inside the -C repo; set XDG_STATE_HOME elsewhere" 70
+  stage="$(mktemp -d "$rsbase/run.XXXXXX")" || die "mktemp failed" 70
   chmod 700 "$stage"; trap 'rm -rf "$stage"' EXIT
   final+=(-o "$stage/last-message.md")
 fi
@@ -127,9 +132,14 @@ if [[ "${DRY_RUN:-0}" == 1 ]]; then
   exit 0
 fi
 [[ -n "$out" ]] || exec codex exec "${final[@]}" - < "$prompt_file"
-codex exec "${final[@]}" - < "$prompt_file"; rc=$?
-if [[ -f "$stage/last-message.md" ]]; then
+rc=0; codex exec "${final[@]}" - < "$prompt_file" || rc=$?
+msg="$stage/last-message.md"
+if [[ -e "$msg" || -L "$msg" ]]; then
+  [[ -L "$msg" || ! -f "$msg" ]] && die "the staged report is not a plain file; report left unsaved" 73
+  [[ -L "$rdir/.scratch" ]] && die "<-C>/.scratch became a symlink while Codex ran; report left unsaved" 73
+  [[ "$(real "$(dirname "$out")" 2>/dev/null)" == "$rodir" ]] || die "the -o folder moved while Codex ran; report left unsaved" 73
+  inside_protected "$rodir" && die "-o folder is now inside a protected folder; report left unsaved" 73
   [[ -L "$out" || -e "$out" ]] && die "-o target appeared while Codex ran; report left unsaved" 73
-  ( set -C; cat "$stage/last-message.md" > "$out" ) || die "could not create $out" 73
+  ( set -C; cat < "$msg" > "$out" ) || die "could not create $out" 73
 fi
 exit "$rc"

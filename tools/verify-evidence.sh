@@ -29,6 +29,7 @@ done
 (($#)) || die "no command given (put it after --)"
 if [[ -n "$tests_re" ]]; then printf '' | grep -E "$tests_re" >/dev/null 2>&1; [[ $? -le 1 ]] || die "--tests-re is not a valid regex"; fi
 
+[[ "$logdir" = /* ]] || logdir="$PWD/$logdir"
 root="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repo"
 cd "$root" || exit 64
 status="$(git status --porcelain --untracked-files=normal)" || die "git status failed"
@@ -42,6 +43,8 @@ fi
 
 # The log lives outside the work tree so writing it never dirties the tree.
 mkdir -p "$logdir" || die "cannot create $logdir"
+rlog="$(cd "$logdir" && pwd -P)"; rroot="$(pwd -P)"
+[[ "$rlog" == "$rroot" || "$rlog" == "$rroot"/* ]] && die "--log-dir must be outside the work tree"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 log="$(mktemp "$logdir/${sha:0:12}-$stamp.XXXXXX")" || die "mktemp failed"
 start=$SECONDS
@@ -52,7 +55,7 @@ valid=1
 [[ "$(git rev-parse --verify HEAD 2>/dev/null)" == "$sha" ]] || valid=0
 dirty && valid=0
 
-cmd="$(printf '%q ' "$@")"
+if (($# == 1)); then cmd="$1 "; else cmd="$(printf '%q ' "$@")"; fi
 echo "### Verification evidence"
 echo "- Commit: \`$sha\` ($branch)"
 echo "- Command: \`${cmd% }\`"

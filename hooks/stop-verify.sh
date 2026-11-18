@@ -73,7 +73,7 @@ verify_root() {
   CODE_RE="$(field "$KEY" code_re)"; VERIFY="$(field "$KEY" verify)"
   REQ="$(field "$KEY" requires)"; LIMIT="$(field "$KEY" limit)"; LIMIT="${LIMIT:-480}"
   [[ -n "$CODE_RE" && -n "$VERIFY" ]] || return 0
-  [[ "$LIMIT" =~ ^[0-9]+$ ]] && (( LIMIT >= 1 && LIMIT <= 3600 )) || { printf '{"systemMessage":"[stop-verify] %s: limit must be 1-3600 seconds; checks skipped"}\n' "$KEY"; return 0; }
+  [[ "$LIMIT" =~ ^[0-9]+$ ]] && (( LIMIT >= 1 && LIMIT <= DEADLINE )) || { printf '{"systemMessage":"[stop-verify] %s: limit must be 1-%s seconds; checks skipped"}\n' "$KEY" "$DEADLINE"; return 0; }
   local re; for re in "$CODE_RE" "$(field "$KEY" tests_re)"; do
     [[ -z "$re" ]] && continue
     printf '' | grep -E "$re" >/dev/null 2>&1; [[ $? -le 1 ]] || { printf '{"systemMessage":"[stop-verify] %s: invalid regex in config; checks skipped"}\n' "$KEY"; return 0; }
@@ -104,13 +104,13 @@ verify_root() {
   } | hsum | cut -c1-40)"
   [[ ${#FPRINT} == 40 ]] || { printf '{"systemMessage":"[stop-verify] could not fingerprint changes; checks skipped"}\n'; return 0; }
   [[ -f "$PASS_FILE" && "$(cat "$PASS_FILE")" == "$FPRINT" ]] && return 0
-  [[ -f "$STATE_DIR/$ID.red" && "$(cat "$STATE_DIR/$ID.red")" == "$FPRINT" ]] && return 0
+  [[ -f "$STATE_DIR/$ID.red" && "$(cat "$STATE_DIR/$ID.red")" == "$FPRINT" ]] && { printf '{"systemMessage":"[stop-verify] %s: checks are still RED for this exact state (an earlier stop gave up). Fix it or tell the user."}\n' "$KEY"; return 0; }
 
   BLOCKS="$(cat "$COUNT_FILE" 2>/dev/null || echo 0)"
   # Checks always run; only after they fail again past MAX_BLOCKS may Claude stop (red).
   give_up() {
     rm -f "$COUNT_FILE"; printf '%s' "$FPRINT" > "$STATE_DIR/$ID.red"
-    printf '{"systemMessage":"[stop-verify] %s still fails after %s tries (%s). Claude stopped anyway; checks are RED. This exact state will not be re-checked."}\n' "$KEY" "$MAX_BLOCKS" "$1"
+    printf '{"systemMessage":"[stop-verify] %s still fails after %s blocked stops (%s). Claude stopped anyway; checks are RED. This exact state will not be re-checked."}\n' "$KEY" "$MAX_BLOCKS" "$1"
     return 0
   }
 
@@ -124,7 +124,7 @@ verify_root() {
       | awk -F'\t' '$1 ~ /^(M|D|R|T)/ {print $2}' | grep -E -- "$TESTS_RE" | sort -u )"
     if [[ -n "$TAMPER" ]] && { git -c core.quotePath=false diff --name-only HEAD 2>/dev/null
          git -c core.quotePath=false ls-files --others --exclude-standard 2>/dev/null; } \
-         | grep -E -- "$CODE_RE" | grep -vqE -- "$TESTS_RE"; then
+         | grep -E -- "$CODE_RE" | grep -vE -- "$TESTS_RE" >/dev/null; then
       if [[ "${STOP_VERIFY_DRY:-0}" == 1 ]]; then echo "[dry] $KEY: test guard would block: $(printf '%s' "$TAMPER" | tr '\n' ' ')" >&2; return 0; fi
       (( BLOCKS >= MAX_BLOCKS )) && { give_up "test guard"; return 0; }
       echo $((BLOCKS + 1)) > "$COUNT_FILE"
@@ -181,7 +181,11 @@ KEY="$(project_of "$ROOT")"
 # Only checkouts listed in "roots" are trusted; a same-named clone elsewhere is ignored.
 RROOT="$(cd "$ROOT" && pwd -P)"
 jq -e --arg k "$KEY" --arg r "$RROOT" '(.[$k].roots // []) | map(sub("/+$";"")) | index($r) != null' "$CONF" >/dev/null 2>&1 || {
-  jq -e --arg k "$KEY" '.[$k].roots' "$CONF" >/dev/null 2>&1 || printf '{"systemMessage":"[stop-verify] %s has no roots list; add this checkout path to roots to trust it"}\n' "$KEY"
+  if jq -e --arg k "$KEY" '.[$k].roots' "$CONF" >/dev/null 2>&1; then
+    [[ "${STOP_VERIFY_DRY:-0}" == 1 ]] && echo "[dry] $KEY: this checkout is not in roots, so it is never run. Its real path is: $RROOT" >&2
+  else
+    printf '{"systemMessage":"[stop-verify] %s has no roots list; add this checkout path to roots to trust it"}\n' "$KEY"
+  fi
   exit 0; }
 verify_root "$ROOT" "$KEY"
 exit $?
