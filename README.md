@@ -12,7 +12,7 @@ If you build software by talking to Claude Code, Codex or Gemini CLI, you cannot
 |---|---|
 | `skills/verify-loop` | Say "verify". The model picks a mode: **start** (agree on 3–5 checkpoints first), **setup** (audit a repo's guardrails), **map** (feature map + a CLI that drives the real app), **triage** (turn a mistake into a check), **done** (evidence, blast radius, risk-tiered review). |
 | `skills/debug` | Say "debug". The model routes: ordinary bug, performance, state/timing, or blast radius. |
-| `hooks/stop-verify.sh` | A Stop hook. When the agent tries to finish in a registered repo with changed code, it runs that repo's checks. Fail or timeout → `exit 2`, the agent must keep working (max 3 blocks). With `tests_re` set, it also blocks a change that edits code and existing tests together; it sees uncommitted edits only (committed test edits are listed by `verify-evidence.sh` for the reviewer). Its own errors never trap the session. |
+| `hooks/stop-verify.sh` | A Stop hook. When the agent tries to finish in a registered repo with changed code, it runs that repo's checks. A failure or a timeout blocks once per exact state (`exit 2`); the same state is not re-run, and after that Claude may stop and sees NOT VERIFIED. With `tests_re` set, it also blocks, once, a change that edits code and existing tests together; it sees uncommitted edits only (committed test edits are listed by `verify-evidence.sh` for the reviewer). Its own errors never trap the session. |
 | `tools/codex-dispatch.sh` | Runs `codex exec` with an allowlist of flags only: read-only or workspace-write, network off by default for the commands Codex runs (the prompt and images still go to the model service; the caller can pass `--net`), no user config (no MCP servers, no notify hooks), workspace-write only in the current repo (or repos you list), the report file only under `<repo>/.scratch/` or `/tmp`. |
 | `tools/verify-evidence.sh` | Runs a check and prints a Markdown evidence block tied to the commit: SHA, command, exit code, log hash, and whether existing tests changed. Refuses a dirty tree; exits 90 (INVALID) if the tree changes during the run or test edits cannot be checked. It prints no log text unless you pass `--tail N`, but it does print the full command. Local evidence helps a reviewer; it cannot see a command that edits files and puts them back. The real gate is CI rerunning on that SHA in a clean checkout. |
 | `docs/METHOD.md` | The method in one page. |
@@ -41,6 +41,8 @@ Copy `examples/stop-verify.projects.json` to `~/.claude/stop-verify.projects.jso
 }
 ```
 
+Optional `skip_re` names files that never trigger a run (generated files, leftovers of killed tests). Each verdict is appended to `~/.claude/state/stop-verify/ledger.tsv` (local, never printed, no full paths).
+
 Before you register a project, ask the agent to run `/verify-loop setup`. It reads the test setup and lists steps that reset a database, deploy, send mail or call paid APIs. If tests reset a database, point `verify` at a throwaway one (see `my-db-app` in the example).
 
 Try it without running anything (from a clone of this repo, inside your project folder):
@@ -58,12 +60,7 @@ DRY_RUN=1 tools/codex-dispatch.sh ...   # print the command only
 Then deny direct `codex` calls so agents are steered to the wrapper. See `examples/settings.snippet.json`. Copy the wrapper to a stable path first; the plugin's own folder changes on every update. With `-s workspace-write`, `-C` must be the repo of the folder you run it from; to allow another repo, add its path to `~/.config/codex-dispatch/repos`.
 
 ### Hard stop on the server: CODEOWNERS for tests
-The Stop hook's test guard runs on your machine and can be bypassed (commit first, then edit the tests). To make test edits impossible to merge without review, let GitHub enforce it:
-1. Copy `examples/CODEOWNERS` to `.github/CODEOWNERS` and set the test paths and the owner.
-2. Turn on branch protection for the default branch with "Require a pull request" and "Require review from Code Owners". Also apply it to administrators.
-3. Let agents push and open PRs from a separate account (a bot account or GitHub App). GitHub does not let an account approve its own PR, so if agents use your account, such a PR can never be approved.
-
-Branch protection is free on public repos; private repos need a paid GitHub plan. If you do not read code, ask a second agent to review the test change and decide on its summary.
+The local test guard can be bypassed (commit first, then edit the tests). Let GitHub enforce it: copy `examples/CODEOWNERS` to `.github/CODEOWNERS` with your test paths and owner, and require a PR with Code Owner review on the default branch (administrators too). Agents must push from a separate account, because GitHub does not let an account approve its own PR. Free on public repos; private repos need a paid plan.
 
 ## Requirements
 macOS or Linux, `bash`, `jq`, `perl`, `git`, `shasum`. Codex CLI for the dispatch script. Tested with Claude Code 2.1.326 and Codex CLI 0.164.0.
@@ -75,6 +72,7 @@ bash tests/run.sh
 
 ## Limits — read these
 - The Stop hook runs your test command with your user's permissions, outside Claude Code's sandbox. The agent can edit `package.json` or the tests, and the hook will then run them. Trust is by path: if you check out someone else's branch or PR in a listed checkout, the hook runs that branch's test scripts as you. Only register checkouts where you run code you trust, have `/verify-loop done` list changes to test scripts in the PR, and use a separate clone (not in `roots`) for outside PRs. To isolate the run, make `verify` start a container or VM yourself.
+- The stop hook does not look for files hidden with skip-worktree/assume-unchanged; the evidence script still refuses them.
 - The hook fires whenever a registered repo has changed code, including your own unfinished work. Claude is told to stop, not edit, when the failures are not from its session, but it may still try.
 - Codex in read-only mode can still read any file your user can read. The wrapper limits writes and network, not reads.
 - "Network off" is a Codex setting the wrapper passes (`sandbox_workspace_write.network_access=false`); the tests check the flag, not real traffic. Check it once on your Codex version.

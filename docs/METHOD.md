@@ -27,12 +27,12 @@ Lauren Tan's inverted pyramid, cheapest and most trusted first:
    3. A lint rule whose error message names the fix. In the same change, remove the old pattern everywhere.
    4. A test. Test outcomes and invariants, not how the code looks.
    5. A step in the feature map that drives the real app.
-   Prove each new check: put a real past mistake back, see the check fail, remove it, see it pass.
+   Prove each new check: put a real past mistake back, see the check fail, remove it, see it pass. Run it alone twice and time it; a killed run must not leave files in the repo.
    - **State and timing bugs** (several devices, rooms, reconnects, schedules, payments): ordinary tests miss interleavings. Model the flow in TLA+, lock the key property in as a repo check, and draw it as a statechart for the human. Pure algorithms with invariants (scoring, sorting): consider a Lean proof. Start with one flow per project. Keep the model in sync with the code or delete it.
    - **Taste** (too wordy, looks generated) → `DESIGN.md` plus screenshots, video or audio for the human.
 4. **Is it just how to do a task?** → a skill or a script. Project rules go in the repo, where every agent can read them.
 
-Hooks: a failed check must `exit 2` (exit 1 counts as done). A hook timeout means nothing was checked, so the Stop hook keeps its own deadline below the hook timeout and counts a timeout as a failure. It blocks at most 3 times. If the hook itself is broken (no `jq`), it exits 0 with a warning and never traps the session.
+Hooks: a failed check must `exit 2` (exit 1 counts as done). A hook timeout means nothing was checked, so the Stop hook keeps its own deadline below the hook timeout. A failure or an unfinished run blocks once per exact state; after that Claude may stop and sees NOT VERIFIED. Every verdict is appended to `~/.claude/state/stop-verify/ledger.tsv` (local, no paths). If the hook itself is broken (no `jq`), it exits 0 with a warning and never traps the session.
 
 ## 2. Who looks at what
 

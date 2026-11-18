@@ -122,14 +122,12 @@ echo b >> "$P/src/a.ts"
 conf "true";   expect_rc 0 "hook: passing checks -> exit 0"   run_hook
 conf "exit 1"; expect_rc 2 "hook: failing checks -> exit 2"   run_hook
 conf "exit 1"; expect_rc 2 "hook: block 1"                    run_hook s2
-               expect_rc 2 "hook: block 2"                    run_hook s2
-               expect_rc 2 "hook: block 3"                    run_hook s2
-               expect_rc 0 "hook: 4th try still runs checks, then gives up red" run_hook s2
-grep -q 'still fails' "$T/out" && ok "hook: says checks are red" || bad "hook: red message"
-               expect_rc 0 "hook: same red state not re-blocked" run_hook s3
-grep -q 'still RED' "$T/out" && ok "hook: a new session is told the state is still red" || bad "hook: silent red cache"
-conf "sleep 5" 1; expect_rc 2 "hook: hitting the limit counts as a failure" run_hook
-grep -q 'limit' "$T/out" && ok "hook: says it hit the limit" || bad "hook: timeout message"
+               expect_rc 0 "hook: same state, same session -> released" run_hook s2
+grep -q 'NOT VERIFIED' "$T/out" && ok "hook: says NOT VERIFIED on release" || bad "hook: release message"
+               expect_rc 2 "hook: another session is blocked once" run_hook s3
+grep -q 'not re-run' "$T/out" && ok "hook: a new session is told the earlier run is not repeated" || bad "hook: red cache message"
+conf "sleep 5" 1; expect_rc 2 "hook: hitting the limit blocks" run_hook
+grep -q 'did NOT FINISH' "$T/out" && ok "hook: says the run did not finish" || bad "hook: timeout message"
 conf "true" "\"abc\""; expect_rc 0 "hook: non-numeric limit is rejected, not run" run_hook
 grep -q 'limit must be' "$T/out" && ok "hook: says the limit is invalid" || bad "hook: limit message"
 C2="$T/clone2"; git clone -q "$P" "$C2"; git -C "$C2" remote set-url origin https://example.com/acme/my-web-app.git; echo z >> "$C2/src/a.ts"
@@ -152,8 +150,8 @@ echo x > "$A/src/a.ts"; AR="$(cd "$A" && pwd -P)"
 printf '{"acme/my-web-app":{"roots":["%s","%s"],"code_re":"^src/.*\\\\.ts$","verify":"exit 1","limit":120}}' "$PR" "$AR" > "$HOME/.claude/stop-verify.projects.json"; rm -rf "$HOME/.claude/state"
 printf '{"cwd":"%s","session_id":"a"}' "$A" | bash "$H" >"$T/out" 2>&1; [[ $? == 0 ]] && ok "hook: same repo name, other owner -> not run" || bad "hook: matched another owner's repo"
 echo c > "$P/src/b c.ts"
-conf 'n=$(printf \"%s\\n\" \"$VERIFY_CHANGED\" | grep -c .); [ $n -eq 2 ] && printf \"%s\" \"$VERIFY_CHANGED\" | grep -qx \"src/b c.ts\"'
-expect_rc 0 "hook: VERIFY_CHANGED is one file per line" run_hook
+conf 'n=$(grep -c . \"$VERIFY_CHANGED_FILE\"); [ $n -eq 2 ] && grep -qx \"src/b c.ts\" \"$VERIFY_CHANGED_FILE\"'
+expect_rc 0 "hook: VERIFY_CHANGED_FILE is one file per line" run_hook
 # test guard
 G="$T/guard"; mkdir -p "$G/src" "$G/tests"; git -C "$G" init -q; git -C "$G" remote add origin https://example.com/acme/guarded.git
 echo a > "$G/src/a.ts"; echo t > "$G/tests/a.test.ts"; git -C "$G" add -A; git -C "$G" -c user.email=t@t -c user.name=t commit -qm init
@@ -178,19 +176,80 @@ printf '{"acme/guarded":{"roots":["%s"],"code_re":"^src/","tests_re":"^tests/","
 echo b2 >> "$G/src/a.ts"; expect_rc 0 "guard: code change passes first" ginput g6
 echo weaker > "$G/tests/a.test.ts"; expect_rc 2 "guard: weakening a test after a pass is still blocked" ginput g6
 git -C "$G" checkout -q tests/a.test.ts
-git -C "$G" update-index --skip-worktree tests/a.test.ts; echo weaker > "$G/tests/a.test.ts"
-expect_rc 2 "guard: test hidden with skip-worktree is still blocked" ginput g7
-git -C "$G" update-index --no-skip-worktree tests/a.test.ts; git -C "$G" checkout -q tests/a.test.ts src/a.ts
+git -C "$G" checkout -q src/a.ts
 # file names with quotes are fingerprinted
 printf '{"acme/guarded":{"roots":["%s"],"code_re":"^src/","verify":"! grep -rq bad src","limit":120}}' "$GR" > "$HOME/.claude/stop-verify.projects.json"; rm -rf "$HOME/.claude/state"
 echo ok > "$G/src/q\"x.ts"; expect_rc 0 "hook: file with a quote in its name passes" ginput q1
 echo bad > "$G/src/q\"x.ts"; expect_rc 2 "hook: breaking that file is caught (no stale pass)" ginput q1
 rm "$G/src/q\"x.ts"
 # a very long change list goes through VERIFY_CHANGED_FILE
-printf '{"acme/guarded":{"roots":["%s"],"code_re":"^src/","verify":"test -s \\"$VERIFY_CHANGED_FILE\\" && test -z \\"$VERIFY_CHANGED\\" && [ $(wc -l < \\"$VERIFY_CHANGED_FILE\\") -ge 3000 ]","limit":120}}' "$GR" > "$HOME/.claude/stop-verify.projects.json"; rm -rf "$HOME/.claude/state"
+printf '{"acme/guarded":{"roots":["%s"],"code_re":"^src/","verify":"test -s \\"$VERIFY_CHANGED_FILE\\" && [ $(wc -l < \\"$VERIFY_CHANGED_FILE\\") -ge 3000 ]","limit":120}}' "$GR" > "$HOME/.claude/stop-verify.projects.json"; rm -rf "$HOME/.claude/state"
 mkdir -p "$G/src/many"; for i in $(seq 1 3000); do : > "$G/src/many/a-rather-long-generated-file-name-number-$i.ts"; done
 expect_rc 0 "hook: 3000 changed files go through VERIFY_CHANGED_FILE (no E2BIG)" ginput big
 rm -r "$G/src/many"
+
+# one block per state: red cache, ledger, background work, skip_re, guard text, deadline
+DP="$T/dp"; mkdir -p "$DP/src" "$DP/tests"; git -C "$DP" init -q; git -C "$DP" remote add origin https://example.com/acme/dapp.git
+echo a > "$DP/src/a.ts"; echo t > "$DP/tests/a.test.ts"; git -C "$DP" add -A; git -C "$DP" -c user.email=t@t -c user.name=t commit -qm init
+DPR="$(cd "$DP" && pwd -P)"; LED="$HOME/.claude/state/stop-verify/ledger.tsv"; RAN="$T/ran"
+dconf() { printf '{"acme/dapp":{"roots":["%s"],"code_re":"^(src|tests|junk)/","tests_re":"^tests/","skip_re":"^junk/","verify":"%s","limit":%s}}' "$DPR" "$1" "${2:-60}" > "$HOME/.claude/stop-verify.projects.json"; rm -rf "$HOME/.claude/state" "$RAN"; }
+dhook() { printf '{"cwd":"%s","session_id":"%s"%s}' "$DP" "$1" "${2:-}" | bash "$H" >"$T/out" 2>&1; }
+druns() { [[ -f "$RAN" ]] && wc -l < "$RAN" | tr -d ' ' || echo 0; }
+echo b >> "$DP/src/a.ts"
+dconf "echo x >> $RAN; echo 'not ok 7 - the named test'; exit 1"
+expect_rc 2 "once: failing state blocks the first stop" dhook s1
+grep -q 'not ok 7 - the named test' "$T/out" && grep -q 'Full log:' "$T/out" && ok "once: names the failing test and the log" || bad "once: excerpt"
+expect_rc 0 "once: same state, same session -> released" dhook s1
+grep -q 'NOT VERIFIED (fail)' "$T/out" && jq -e .systemMessage "$T/out" >/dev/null && ok "once: release is a visible note" || bad "once: release note"
+[[ "$(druns)" == 1 ]] && ok "once: checks ran once, not twice" || bad "once: ran $(druns) times"
+expect_rc 0 "once: third stop still released (no flip-flop)" dhook s1
+expect_rc 2 "once: another session is blocked once, without a run" dhook s2
+grep -q 'not re-run' "$T/out" && grep -q 'not ok 7' "$T/out" && [[ "$(druns)" == 1 ]] && ok "once: says not re-run and shows the saved failure" || bad "once: other-session message"
+expect_rc 0 "once: that session's next stop is released" dhook s2
+[[ "$(stat -f %Lp "$HOME"/.claude/state/stop-verify/*.fail.log 2>/dev/null || stat -c %a "$HOME"/.claude/state/stop-verify/*.fail.log)" == 600 ]] && ok "once: fail log is mode 600" || bad "once: fail log mode"
+echo c >> "$DP/src/a.ts"; expect_rc 2 "once: changed state runs and blocks again" dhook s1 ',"stop_hook_active":true'
+[[ "$(druns)" == 2 ]] && ok "once: second run for the new state" || bad "once: ran $(druns) times"
+dconf "true"; echo d >> "$DP/src/a.ts"; expect_rc 0 "once: fixed state passes" dhook s1 ',"stop_hook_active":true'
+ls "$HOME/.claude/state/stop-verify/" | grep -qE '\.(red|fail\.log|s1\.blocks)$' && bad "once: red, log or blocks left behind" || ok "once: pass removes red, log and blocks"
+dconf "exit 1"
+for i in 1 2 3; do echo "e$i" >> "$DP/src/a.ts"; expect_rc 2 "row: block $i" dhook s3 ',"stop_hook_active":true'; done
+echo e4 >> "$DP/src/a.ts"; expect_rc 0 "row: 4th failing state in a row is released" dhook s3 ',"stop_hook_active":true'
+dconf "exit 1"
+for i in 1 2 3 4; do echo "f$i" >> "$DP/src/a.ts"; expect_rc 2 "row: stop_hook_active=false never adds up: block $i" dhook s4 ',"stop_hook_active":false'; done
+dconf "echo x >> $RAN; sleep 5" 1; echo g >> "$DP/src/a.ts"
+expect_rc 2 "timeout: blocks once" dhook s5
+grep -q "NOT FINISH" "$T/out" && grep -q "not a test failure" "$T/out" && ok "timeout: says not verified, not a failure" || bad "timeout: message"
+expect_rc 0 "timeout: same state is released" dhook s5
+[[ "$(druns)" == 1 ]] && grep -q 'NOT VERIFIED (timeout)' "$T/out" && ok "timeout: no second run, note says timeout" || bad "timeout: rerun or note"
+dconf "exit 1"; echo h >> "$DP/src/a.ts"
+expect_rc 0 "busy: subagent in flight -> deferred" dhook s6 ',"background_tasks":[{"id":"a","type":"subagent","status":"running"}]'
+[[ ! -s "$T/out" ]] && grep -q $'\tdeferred\t' "$LED" && ok "busy: silent, ledger says deferred" || bad "busy: output or ledger"
+expect_rc 0 "busy: workflow in flight -> deferred" dhook s6 ',"background_tasks":[{"id":"w","type":"workflow","status":"running"}]'
+expect_rc 0 "busy: codex-dispatch shell in flight -> deferred" dhook s6 ',"background_tasks":[{"id":"b","type":"shell","command":"/x/codex-dispatch.sh -f t.md"}]'
+expect_rc 2 "busy: a dev server shell does not defer" dhook s6 ',"background_tasks":[{"id":"c","type":"shell","command":"npm run serve"}]'
+expect_rc 2 "busy: empty list -> checked" dhook s7 ',"background_tasks":[]'
+git -C "$DP" checkout -q src/a.ts; dconf "exit 1"; mkdir -p "$DP/junk"; echo j > "$DP/junk/left.ts"
+expect_rc 0 "skip_re: leftover folder alone does not trigger" dhook s8
+echo weaker > "$DP/tests/a.test.ts"; dconf "true"
+expect_rc 0 "skip_re: test edit + skipped leftover is test-only" dhook s8b
+grep -q 'test guard' "$T/out" && bad "skip_re: guard fired on a skipped file" || ok "skip_re: guard ignores skipped files"
+git -C "$DP" checkout -q tests/a.test.ts; /bin/rm -rf "$DP/junk"
+dconf "true"; echo k >> "$DP/src/a.ts"; echo weaker > "$DP/tests/a.test.ts"
+expect_rc 2 "guard: blocks once" dhook s9
+grep -q 'do NOT revert' "$T/out" && grep -q 'Uncommitted' "$T/out" && ! grep -q 'Revert the edits' "$T/out" && ok "guard: says uncommitted, never orders a revert of others' work" || bad "guard: message"
+expect_rc 0 "guard: same state is released" dhook s9
+grep -q 'NOT VERIFIED (guard)' "$T/out" && ok "guard: release note" || bad "guard: note"
+echo '// a comment' >> "$DP/tests/a.test.ts"; expect_rc 2 "guard: comment-only test edit + code edit is still blocked" dhook s10
+awk -F'\t' 'NF!=9{bad=1} END{exit bad}' "$LED" && [[ -s "$LED" ]] && ok "ledger: every line has 9 tab fields" || bad "ledger: field count"
+grep -q "$DPR" "$LED" && bad "ledger: holds a full path" || ok "ledger: no full path"
+git -C "$DP" checkout -q tests/a.test.ts src/a.ts
+dconf "echo x >> $RAN; exit 1"; echo m >> "$DP/src/a.ts"
+STOP_VERIFY_DEADLINE=0 dhook s11; [[ $? == 2 && "$(druns)" == 1 ]] && ok "deadline: 0 falls back to 540" || bad "deadline: 0"
+dconf "echo x >> $RAN; exit 1"; echo n >> "$DP/src/a.ts"
+STOP_VERIFY_DEADLINE=9999 dhook s12; [[ $? == 2 && "$(druns)" == 1 ]] && ok "deadline: 9999 falls back to 540" || bad "deadline: 9999"
+dconf "echo x >> $RAN; exit 1"; echo o >> "$DP/src/a.ts"
+STOP_VERIFY_DEADLINE=abc dhook s13; [[ $? == 2 && "$(druns)" == 1 ]] && ok "deadline: non-number falls back to 540" || bad "deadline: abc"
+git -C "$DP" checkout -q src/a.ts
 
 # evidence
 E="$ROOT/tools/verify-evidence.sh"
