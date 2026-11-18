@@ -41,7 +41,7 @@ Copy `examples/stop-verify.projects.json` to `~/.claude/stop-verify.projects.jso
 }
 ```
 
-Optional `skip_re` names files that never trigger a run (generated files, leftovers of killed tests). Each verdict is appended to `~/.claude/state/stop-verify/ledger.tsv` (local, never printed, no full paths).
+Optional `skip_re` names files that never trigger a run (generated files, leftovers of killed tests). Each verdict is appended to `~/.claude/state/stop-verify/ledger.tsv` (local, never printed, no full paths). Checks are skipped while a subagent, workflow or `codex-dispatch.sh` is running and happen at the next stop. `STOP_VERIFY_DEADLINE` (120..540 s, default 540) is the total time budget. To force a re-run of a failed state, change a file or delete `<state dir>/<id>.red`. `VERIFY_CHANGED_FILE` is newline-separated, so file names with newlines are not supported.
 
 Before you register a project, ask the agent to run `/verify-loop setup`. It reads the test setup and lists steps that reset a database, deploy, send mail or call paid APIs. If tests reset a database, point `verify` at a throwaway one (see `my-db-app` in the example).
 

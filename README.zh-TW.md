@@ -17,7 +17,7 @@
 | `tools/verify-evidence.sh` | 跑檢查並產生綁 commit 的證據段：SHA、指令、結束碼、log 雜湊、有沒有改到既有測試。工作區不乾淨就拒跑；中途有變動或無法檢查測試改動時結束碼 90（INVALID）。預設不印 log 內容，要附 log 尾段用 `--tail N`；但會印出完整指令，密碼請用環境變數傳，貼到公開 PR 前先看過整段。指令若改檔再改回，本機證據看不出來；真正的關卡是 CI 在乾淨 checkout 上重跑。 |
 | `docs/METHOD.zh-TW.md` | 一頁說完方法。 |
 
-安裝與設定步驟請看 [README.md](README.md)（指令相同）。專案登記的 key 是 `owner/repo`，例如 `alice/shop`；另外必須填 `roots`：你信任的 checkout 絕對路徑。其他位置的 clone（就算同一個 repo）都不會被執行，hook 會提示並印出該補進 `roots` 的實際路徑。信任的 checkout 底下的 linked worktree 也算信任。選填 `skip_re`：符合的檔案不會觸發檢查（自動產生的檔案、被中斷的測試留下的資料夾）。每次判定都會追加一行到 `~/.claude/state/stop-verify/ledger.tsv`（只在本機、不印出、不含完整路徑）。登記前先請 AI 跑 `/verify-loop setup`，它會讀測試設定，列出會重置資料庫、部署、寄信或打付費 API 的步驟。
+安裝與設定步驟請看 [README.md](README.md)（指令相同）。專案登記的 key 是 `owner/repo`，例如 `alice/shop`；另外必須填 `roots`：你信任的 checkout 絕對路徑。其他位置的 clone（就算同一個 repo）都不會被執行，hook 會提示並印出該補進 `roots` 的實際路徑。信任的 checkout 底下的 linked worktree 也算信任。選填 `skip_re`：符合的檔案不會觸發檢查（自動產生的檔案、被中斷的測試留下的資料夾）。每次判定都會追加一行到 `~/.claude/state/stop-verify/ledger.tsv`（只在本機、不印出、不含完整路徑）。有子代理、workflow 或 `codex-dispatch.sh` 在跑時會先不檢查，等下一次收工再跑。`STOP_VERIFY_DEADLINE`（120..540 秒，預設 540）是總時間上限。要強制重跑已失敗的狀態：改一個檔案，或刪掉 `<state 資料夾>/<id>.red`。`VERIFY_CHANGED_FILE` 以換行分隔，所以不支援含換行的檔名。登記前先請 AI 跑 `/verify-loop setup`，它會讀測試設定，列出會重置資料庫、部署、寄信或打付費 API 的步驟。
 
 ## 伺服器端硬擋：用 CODEOWNERS 保護測試
 本機的測試守衛可以被繞過（先 commit 再改測試），交給 GitHub 擋：把 `examples/CODEOWNERS` 複製到 `.github/CODEOWNERS`，填上測試路徑和負責人，預設分支要求 PR 與 Code Owner 審核（管理員也適用）。AI 必須用另一個帳號 push，因為 GitHub 不准帳號核准自己的 PR。公開 repo 免費；私人 repo 需付費方案。

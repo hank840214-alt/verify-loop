@@ -22,7 +22,7 @@ Pick the mode from the conversation without asking: a multi-step task is startin
 2. Output a table: item | current state (file:line) | gap | who fixes it. Check:
    - Tests run. **Before running**, read the test setup for steps that reset a database, deploy, send mail, call paid APIs or write into the repo. If found, run in a copy or a throwaway database, or only list the risk. Run twice; a test that changes result is flaky. Time it.
    - CI runs the same tests.
-   - The Stop hook covers this repo (`~/.claude/stop-verify.projects.json`), its `code_re` includes every file type the tests read (`skip_re` excludes generated files and leftovers of killed runs), and `limit` ≥ 1.5× the measured time and < 540 s. A verify command that touches a database must point at a throwaway one and check that it does.
+   - The Stop hook covers this repo (`~/.claude/stop-verify.projects.json`), its `code_re` includes every file type the tests read (`skip_re` excludes generated files and leftovers of killed runs; checks wait while agents run and happen at the next stop), and `limit` ≥ 1.5× the measured time and < 540 s. A verify command that touches a database must point at a throwaway one and check that it does.
    - Deny rules cover this project's secrets (including backup copies outside the repo). Sandbox on where possible; `excludedCommands` lists no agent launchers, `osascript *` or `docker *`.
    - Codex goes through the `codex-dispatch.sh` wrapper at the stable path the user set up (see README); the bundled copy is `${CLAUDE_PLUGIN_ROOT}/tools/codex-dispatch.sh`.
    - Lint exists (missing lint is the first gap). Folder boundaries / import bans exist.
