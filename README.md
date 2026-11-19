@@ -14,7 +14,7 @@ If you build software by talking to Claude Code, Codex or Gemini CLI, you cannot
 | `skills/debug` | Say "debug". The model routes: ordinary bug, performance, state/timing, or blast radius. |
 | `hooks/stop-verify.sh` | A Stop hook. When the agent tries to finish in a registered repo with changed code, it runs that repo's checks. A failure or a timeout blocks once per exact state (`exit 2`); the same state is not re-run, and after that Claude may stop and sees NOT VERIFIED. With `tests_re` set, it also blocks, once, a change that edits code and existing tests together; it sees uncommitted edits only (committed test edits are listed by `verify-evidence.sh` for the reviewer). Its own errors never trap the session. |
 | `tools/codex-dispatch.sh` | Runs `codex exec` with an allowlist of flags only: read-only or workspace-write, network off by default for the commands Codex runs (the prompt and images still go to the model service; the caller can pass `--net`), no user config (no MCP servers, no notify hooks), workspace-write only in the current repo (or repos you list), the report file only under `<repo>/.scratch/` or `/tmp`. |
-| `tools/verify-evidence.sh` | Runs a check and prints a Markdown evidence block tied to the commit: SHA, command, exit code, log hash, and whether existing tests changed. Refuses a dirty tree; exits 90 (INVALID) if the tree changes during the run or test edits cannot be checked. It prints no log text unless you pass `--tail N`, but it does print the full command. Local evidence helps a reviewer; it cannot see a command that edits files and puts them back. The real gate is CI rerunning on that SHA in a clean checkout. |
+| `tools/verify-evidence.sh` | Runs a check and prints a Markdown evidence block tied to the commit: SHA, command, exit code, log hash, the `node` and `python3` it found on `PATH` (add more with `--tool <name>`), and whether existing tests changed. A test added in the branch and edited again is listed under its own heading. The script does not change `PATH`: if the tools line shows a shim or an old interpreter, fix `PATH` and rerun. Refuses a dirty tree; exits 90 (INVALID) if the tree changes during the run or test edits cannot be checked. It prints no log text unless you pass `--tail N`, but it does print the full command. Local evidence helps a reviewer; it cannot see a command that edits files and puts them back. The real gate is CI rerunning on that SHA in a clean checkout. |
 | `docs/METHOD.md` | The method in one page. |
 
 ## Install
@@ -82,6 +82,20 @@ bash tests/run.sh
 - Deny rules steer agents away from calling `codex` directly; they are not a sandbox.
 - `excludedCommands` is a convenience, not a security boundary.
 - This is a workflow, not a guarantee. High-risk changes (money, login, deleting data) need two independent AI reviews and a way to roll back; if someone who reads code is available, have them look too.
+
+## Field notes
+
+From the first real runs, on a multiplayer game project.
+
+- "Each test passes alone" is not a conclusion. Read the failing log for a signal the system printed itself. Every failure had a guard's shutdown line just before it; that line was the root cause.
+- Reproduce "the machine was busy" on purpose. Blocking the event loop inside the test process reproduced it; twenty idle-spinning CPU processes did not.
+- Produce evidence with a clean `PATH`. Two full runs showed 44 and 39 false failures from an old system interpreter and from a shim.
+- A new check can be flaky too. Keep only the one signal under test real, inject the rest, then put the old mistake back and see the check fail.
+- A flow that passes is not proof until the screenshot shows what the feature map promises. A helper-character flow passed on game state while the helper was off screen, and later while it stood under a HUD panel. The check now requires the visible label, uncovered, before and after the shot.
+- Drive the build players get. The first driver built without the production feature flags, so four flows passed on screens no player sees.
+- Tie the picture to the code. A screenshot stamped with a commit id must come from that commit; an uncommitted build is stamped `+dirty`, and a running instance built from another state is refused.
+- A verification tool that starts processes must prove a process is its own before it stops it. A recorded PID is not proof after a reboot; record the start time and command line too.
+- Every one of these was found by an independent reviewer or by rerunning, not by the session that wrote the code.
 
 ## License
 MIT. Inspired by talks from Lydia Hallie and Lauren Tan, with some skill steps adapted from Lauren Tan's MIT-licensed pstack; not affiliated with or endorsed by them. See [CREDITS](CREDITS.md).
