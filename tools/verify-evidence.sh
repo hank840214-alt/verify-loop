@@ -9,10 +9,11 @@
 # Usage (from inside the repo):
 #   verify-evidence.sh [--tests-re <regex>] [--base <ref>] [--log-dir <dir>] [--tail N] [--tool <name>]... -- <command> [args...]
 #   verify-evidence.sh ... -- 'npx tsc --noEmit && npm test'   # one quoted string runs in bash -c
-# The block lists tools on PATH (node, python3 and any --tool names). Log text
-# is included only with --tail N.
+# The block prints log text only with --tail N. Tool paths mask the home folder,
+# other users' folders under /Users or /home, and names under /Volumes.
 # With --tests-re, tests added in this branch and edited again later have their
 # own heading immediately after the existing-tests report.
+# A renamed existing test is listed under "Existing tests changed" by its deleted name, and under the added heading by its new name if edited again.
 # Exit: the command's exit code; 90 if the evidence is invalid (tree or HEAD changed
 # during the run, hidden files, or --tests-re given but test edits could not be checked);
 # 64 for usage errors or a dirty tree.
@@ -63,19 +64,39 @@ rlog="$(cd "$logdir" && pwd -P)"; rroot="$(pwd -P)"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 log="$(mktemp "$logdir/${sha:0:12}-$stamp.XXXXXX")" || die "mktemp failed"
 
+probe_version() (
+  local output
+  output="$(mktemp "$logdir/version.XXXXXX")" || return 1
+  trap 'rm -f "$output"' EXIT
+  if [[ -n "$timeout_path" ]]; then
+    "$timeout_path" -s KILL 5 "$1" --version </dev/null >"$output" 2>&1 || return 1
+  elif [[ -n "$perl_path" ]]; then
+    "$perl_path" -e '
+      my $pid = fork();
+      defined $pid or exit 1;
+      if (!$pid) { setpgrp(0, 0) or exit 1; exec @ARGV or exit 127 }
+      $SIG{ALRM} = sub { kill "KILL", -$pid; kill "KILL", $pid; exit 124 };
+      alarm 5;
+      waitpid($pid, 0) == $pid or exit 1;
+      exit($? == 0 ? 0 : 1);
+    ' "$1" --version </dev/null >"$output" 2>&1 || return 1
+  else
+    return 1
+  fi
+  # Treat bare CR as a line boundary too, so overwritten terminal text stays out.
+  head -n 1 "$output" | sed $'s/\r.*//' | tr -d '[:cntrl:]`<>'
+)
+
+timeout_path="$(type -P timeout)"
+perl_path="$(type -P perl)"
+tool_home="${HOME:-}"
+while [[ "$tool_home" == */ ]]; do tool_home="${tool_home%/}"; done
 tools_on_path="" found_tool=0
 for name in "${tool_names[@]}"; do
-  if path="$(command -v -- "$name")"; then
+  if path="$(type -P -- "$name")"; then
     found_tool=1
-    if command -v timeout >/dev/null 2>&1 && [[ "$path" == */* ]]; then
-      version="$(timeout -s KILL 5 "$path" --version 2>&1)" || version="?"
-    elif command -v timeout >/dev/null 2>&1; then
-      version="$(timeout -s KILL 5 "$BASH" -c 'command -- "$1" --version' _ "$name" 2>&1)" || version="?"
-    else
-      version="$(command -- "$name" --version 2>&1)" || version="?"
-    fi
-    version="${version%%$'\n'*}"
-    version="${version%$'\r'}"
+    version="$(probe_version "$path" 2>/dev/null)" || version="?"
+    version="${version:0:40}"
     if [[ "$version" == *[[:blank:]]* ]]; then
       prefix="${version%%[[:blank:]]*}"
       if [[ "$(printf '%s' "$prefix" | tr '[:upper:]' '[:lower:]')" == "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" ||
@@ -83,6 +104,16 @@ for name in "${tool_names[@]}"; do
         version="${version#"$prefix"}"
         version="${version#"${version%%[![:blank:]]*}"}"
       fi
+    fi
+    if [[ -n "$tool_home" && "$path" == "$tool_home"/* ]]; then
+      path="~/${path#"$tool_home"/}"
+    elif [[ "$path" == /Users/?*/* || "$path" == /home/?*/* ]]; then
+      rest="${path#/*/}"
+      path="~other/${rest#*/}"
+    fi
+    if [[ "$path" == /Volumes/?*/* ]]; then
+      rest="${path#/Volumes/}"
+      path="/Volumes/…/${rest#*/}"
     fi
     entry="$name ${version:-?} ($path)"
   else
@@ -93,8 +124,6 @@ done
 if ((!found_tool && ${#tool_names[@]} == 2)); then
   tools_on_path="none of node, python3 found"
 fi
-home_marker='~'
-[[ -z "${HOME:-}" ]] || tools_on_path="${tools_on_path//"$HOME"/$home_marker}"
 
 start=$SECONDS
 if (($# == 1)); then bash -c "$1" >"$log" 2>&1; rc=$?; else "$@" >"$log" 2>&1; rc=$?; fi
