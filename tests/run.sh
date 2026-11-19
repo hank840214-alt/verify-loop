@@ -372,6 +372,9 @@ echo t2 > "$G/tests/b.test.ts"; git -C "$G" add -A; git -C "$G" -c user.email=t@
 echo weaker > "$G/tests/b.test.ts"; git -C "$G" -c user.email=t@t -c user.name=t commit -qam "weaken test"
 expect_rc 0 "evidence: run with base" in_g --tests-re '^tests/' --base "$(git -C "$G" rev-list --max-parents=0 HEAD)" -- true
 grep -q 'tests/b.test.ts' "$T/out" && ok "evidence: add-then-weaken inside the branch is reported" || bad "evidence: missed weakened test"
+section() { awk -v h="$1" '/^- /{on = index($0, h) == 1} on' "$T/out"; }
+section '- Tests added in this branch and edited again' | grep -q 'tests/b.test.ts' && ok "evidence: a test added then edited in the branch has its own heading" || bad "evidence: added-then-edited heading"
+section '- Existing tests changed' | grep -q 'tests/b.test.ts' && bad "evidence: a test added in the branch is called existing" || ok "evidence: a test added in the branch is not called existing"
 expect_rc 90 "evidence: bad base -> INVALID" in_g --tests-re '^tests/' --base no-such-ref -- true
 grep -q UNKNOWN "$T/out" && ok "evidence: bad base reports UNKNOWN" || bad "evidence: bad base"
 expect_rc 90 "evidence: base that already contains HEAD -> UNKNOWN, INVALID" in_g --tests-re '^tests/' --base HEAD -- true
@@ -385,6 +388,11 @@ echo q > "$G/tests/q\"x.test.ts"; git -C "$G" add -A; git -C "$G" -c user.email=
 QB="$(git -C "$G" rev-parse HEAD)"; echo weaker > "$G/tests/q\"x.test.ts"; git -C "$G" -c user.email=t@t -c user.name=t commit -qam "weaken quote test"
 expect_rc 0 "evidence: run with a quoted test name" in_g --tests-re '^tests/' --base "$QB" -- true
 grep -qF 'tests/q"x.test.ts' "$T/out" && ok "evidence: edited test with a quote in its name is listed" || bad "evidence: missed quoted test name"
+section '- Existing tests changed' | grep -qF 'tests/q"x.test.ts' && ok "evidence: a test that exists at the base is listed as existing" || bad "evidence: existing test heading"
+mkdir -p "$HOME/fakebin"; printf '#!/bin/sh\necho "Python 9.9.9"\n' > "$HOME/fakebin/python3"; chmod +x "$HOME/fakebin/python3"
+PATH="$HOME/fakebin:$PATH" expect_rc 0 "evidence: run with another python3 first on PATH" in_g -- true
+grep '^- Tools on PATH: ' "$T/out" | grep -F '~/fakebin/python3' | grep -qF '9.9.9' && ok "evidence: names the python3 it would run, with its version" || bad "evidence: tools line"
+grep -q "$HOME" "$T/out" && bad "evidence: tools line prints a local path" || ok "evidence: tools line keeps the home folder out"
 expect_rc 1 "evidence: failing command keeps exit code" in_g -- false
 grep -q FAIL "$T/out" && ok "evidence: says FAIL" || bad "evidence: FAIL label"
 
