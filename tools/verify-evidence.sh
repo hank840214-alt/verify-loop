@@ -11,6 +11,7 @@
 #   verify-evidence.sh ... -- 'npx tsc --noEmit && npm test'   # one quoted string runs in bash -c
 # The block prints log text only with --tail N. Tool paths mask the home folder,
 # other users' folders under /Users or /home, and names under /Volumes.
+# Tool versions show only the first version token on the probe's first line, or ?.
 # With --tests-re, tests added in this branch and edited again later have their
 # own heading immediately after the existing-tests report.
 # A renamed existing test is listed under "Existing tests changed" by its deleted name, and under the added heading by its new name if edited again.
@@ -65,7 +66,7 @@ stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 log="$(mktemp "$logdir/${sha:0:12}-$stamp.XXXXXX")" || die "mktemp failed"
 
 probe_version() (
-  local output
+  local output line version_re='v?[0-9][0-9A-Za-z.+_-]{0,30}'
   output="$(mktemp "$logdir/version.XXXXXX")" || return 1
   trap 'rm -f "$output"' EXIT
   if [[ -n "$timeout_path" ]]; then
@@ -84,7 +85,10 @@ probe_version() (
     return 1
   fi
   # Treat bare CR as a line boundary too, so overwritten terminal text stays out.
-  head -n 1 "$output" | sed $'s/\r.*//' | tr -d '[:cntrl:]`<>'
+  line="$(head -n 1 "$output" | sed $'s/\r.*//')" || return 1
+  local LC_ALL=C
+  [[ "$line" =~ $version_re ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[0]}"
 )
 
 timeout_path="$(type -P timeout)"
@@ -96,15 +100,6 @@ for name in "${tool_names[@]}"; do
   if path="$(type -P -- "$name")"; then
     found_tool=1
     version="$(probe_version "$path" 2>/dev/null)" || version="?"
-    version="${version:0:40}"
-    if [[ "$version" == *[[:blank:]]* ]]; then
-      prefix="${version%%[[:blank:]]*}"
-      if [[ "$(printf '%s' "$prefix" | tr '[:upper:]' '[:lower:]')" == "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" ||
-            ( "$name" == python3 && "$prefix" == Python ) ]]; then
-        version="${version#"$prefix"}"
-        version="${version#"${version%%[![:blank:]]*}"}"
-      fi
-    fi
     if [[ -n "$tool_home" && "$path" == "$tool_home"/* ]]; then
       path="~/${path#"$tool_home"/}"
     elif [[ "$path" == /Users/?*/* || "$path" == /home/?*/* ]]; then
@@ -115,7 +110,7 @@ for name in "${tool_names[@]}"; do
       rest="${path#/Volumes/}"
       path="/Volumes/…/${rest#*/}"
     fi
-    entry="$name ${version:-?} ($path)"
+    entry="$name $version ($path)"
   else
     entry="$name not found"
   fi
