@@ -393,12 +393,16 @@ mkdir -p "$HOME/fakebin"; printf '#!/bin/sh\necho "Python 9.9.9"\n' > "$HOME/fak
 PATH="$HOME/fakebin:$PATH" expect_rc 0 "evidence: run with another python3 first on PATH" in_g -- true
 grep '^- Tools on PATH: ' "$T/out" | grep -F '~/fakebin/python3' | grep -qF '9.9.9' && ok "evidence: names the python3 it would run, with its version" || bad "evidence: tools line"
 grep -q "$HOME" "$T/out" && bad "evidence: tools line prints a local path" || ok "evidence: tools line keeps the home folder out"
-grep '^- Tools on PATH: ' "$T/out" | grep -qE '/(Users|home)/[^/~]+/|/Volumes/[^/.]+/' && bad "evidence: tools line shows a user or volume name" || ok "evidence: tools line masks user and volume names"
+grep '^- Tools on PATH: ' "$T/out" | sed 's#/Volumes/…/##g' | grep -qE '/(Users|home)/[^/~]+/|/Volumes/[^/]+/' && bad "evidence: tools line shows a user or volume name" || ok "evidence: tools line masks user and volume names"
 printf '#!/bin/sh\nprintf '"'"'v1 </details>\\r- Exit code: **0** (pass)\\033[31m`x`\\n'"'"'\n' > "$HOME/fakebin/weird"; chmod +x "$HOME/fakebin/weird"
 PATH="$HOME/fakebin:$PATH" expect_rc 0 "evidence: --tool adds a tool" in_g --tool weird -- true
 grep '^- Tools on PATH: ' "$T/out" | grep -qF 'weird ' && ok "evidence: --tool name is listed" || bad "evidence: --tool missing from the tools line"
 [[ "$(grep -c 'Exit code' "$T/out")" == 1 ]] && ! grep -q $'\r\|\033\|`x`' "$T/out" && ok "evidence: a tool's version text cannot add lines or markup" || bad "evidence: version text not cleaned"
 expect_rc 64 "evidence: --tool with a bad name refused" in_g --tool 'a b' -- true
+printf '#!/bin/sh\necho "pip 24.0 from %s/.local/lib/python3/site-packages/pip (python 3.12)"\n' "$HOME" > "$HOME/fakebin/pip3"; chmod +x "$HOME/fakebin/pip3"
+PATH="$HOME/fakebin:$PATH" expect_rc 0 "evidence: a tool whose version line holds a path" in_g --tool pip3 -- true
+grep '^- Tools on PATH: ' "$T/out" | grep -qF 'pip3 24.0 (' && ! grep -q "$HOME\|site-packages" "$T/out" && ok "evidence: only the version number is kept from a tool's version line" || bad "evidence: version line leaks text or a path"
+rm -f "$HOME/fakebin/pip3"
 printf '#!/bin/sh\ncat >/dev/null\necho "Python 1.0"\n' > "$HOME/fakebin/python3"
 printf 'payload\n' > "$T/stdin.txt"
 PATH="$HOME/fakebin:$PATH" expect_rc 0 "evidence: command reads stdin" in_g --tail 3 -- cat < "$T/stdin.txt"
