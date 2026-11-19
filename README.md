@@ -130,5 +130,13 @@ From the first real runs, on one app with a server and a browser client. The dri
 - Every one of these was found by an independent reviewer or by rerunning, not by the session that wrote the code.
 - In the evidence block, a test added in the branch and edited again has its own heading; it is no longer called an existing test.
 
+From the first day of the two edit and hand-back hooks, on the same project (two small ledgers, so treat these as early signs, not results):
+
+- Unit tests are not enough for a hook; run it once in the real host. The first layer-2 version listened for the subagent's stop event and passed 212 unit tests. In real use it logged two failures and nothing was fixed: by the time the block arrived, the subagent had already handed in. Moving it to the hand-back tool call gave one full fail → fix → pass cycle.
+- Set the time limit from runs on a busy machine. The full test suite took 133–226 s under load, against an estimated 100–130 s when idle. A first limit of 200 s meant every busy run ended as "not verified".
+- A file the checker does not cover is skipped, not passed. That project's type-check config covered only two of its folders, so edits elsewhere were logged as `skip`.
+- Most subagents change nothing. 11 of 17 layer-2 entries were read-only subagents, so the check cost them nothing.
+- The quick check paid off at once: three blocks after an edit, each fixed by the next edit 4–6 s later. Each check took 2–6 s. No false blocks yet.
+
 ## License
 MIT. Inspired by talks from Lydia Hallie and Lauren Tan, with some skill steps adapted from Lauren Tan's MIT-licensed pstack; not affiliated with or endorsed by them. See [CREDITS](CREDITS.md).
