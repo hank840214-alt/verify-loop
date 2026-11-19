@@ -91,9 +91,10 @@ fi
 
 # ---------- inner ----------
 START=$SECONDS
-LOG=""; LIST=""; STARTED=""; XF1=""; XF2=""; FPD=""; FPU=""; FPF=""; LOCKHELD=0; LOCKD=""
+LOG=""; LIST=""; STARTED=""; SDIR=""; XF1=""; XF2=""; FPD=""; FPU=""; FPF=""; LOCKHELD=0; LOCKD=""
 cleanup() {
-  /bin/rm -f "$LOG" "$LIST" "$STARTED" "$XF1" "$XF2" "$FPD" "$FPU" "$FPF" 2>/dev/null
+  /bin/rm -f "$LOG" "$LIST" "$XF1" "$XF2" "$FPD" "$FPU" "$FPF" 2>/dev/null
+  [[ -n "$SDIR" ]] && /bin/rm -rf "$SDIR" 2>/dev/null
   (( LOCKHELD )) && [[ -n "$LOCKD" ]] && rmdir "$LOCKD" 2>/dev/null
   return 0
 }
@@ -139,6 +140,10 @@ fi
 OK_JQ='
   [inputs] as $all
   | (reduce ($all[] | select(.type == "user") | .message.content? | arrays | .[]
+        | select(type == "object" and .type == "tool_result" and (.is_error // false) == true
+          and ((.content | if type == "string" then . elif type == "array" then (map(.text? // "") | join("")) else "" end) | startswith("Permission to use Bash denied")))
+        | .tool_use_id) as $id ({}; .[$id] = true)) as $denied
+  | (reduce ($all[] | select(.type == "user") | .message.content? | arrays | .[]
         | select(type == "object" and .type == "tool_result")
         | .tool_use_id) as $id ({}; .[$id] = true)) as $seen
   | (reduce ($all[] | select(.type == "user") | .message.content? | arrays | .[]
@@ -154,10 +159,13 @@ FILES_JQ="$OK_JQ"'
   | unique | .[] | . + "\u0000"'
 # Bash calls with a write sign: prints cwd NUL command NUL. A call whose result was an error still
 # counts (a command can write and then fail); a call with no result at all does not (it may never
-# have run).
+# have run), and neither does one the host or a hook refused to run. Observed in real transcripts:
+# the tool_result has is_error true and content starting with
+#   Permission to use Bash denied by plugin <name>: This call was refused: ...
+# Only that text is matched; no other refusal wording has been seen, so none is guessed.
 BASH_JQ="$OK_JQ"'
   | $all[] | select(.type == "assistant") | (.cwd // "") as $cwd | .message.content? | arrays | .[]
-    | select(type == "object" and .type == "tool_use" and .name == "Bash" and ($seen[.id // ""] == true))
+    | select(type == "object" and .type == "tool_use" and .name == "Bash" and ($seen[.id // ""] == true) and ($denied[.id // ""] != true))
     | (.input.command // "" | tostring) as $c
     | ($c | gsub("[0-9]?>&[0-9]"; "") | gsub("[0-9]?>>? ?/dev/null"; "")) as $x
     | select($x | test(">|>>|sed +(-[A-Za-z]+ +)*-i|git apply|(^|[;&|(] *)(mv|cp|rm|tee|patch|install) |git +(-[Cc] +.*[ \"])?(checkout|switch|reset|restore|apply|am|merge|rebase|cherry-pick|commit|rm|mv|clean|stash( +(push|pop|apply|drop|save|clear|branch|create|store)|( +-[-A-Za-z]+)*( *$| *[;&|])))|\\.write_text|\\.write_bytes|writeFileSync"))
@@ -282,6 +290,7 @@ fingerprint() {  # root -> sets FPRES to a hash; fails (FPRES empty) if any step
 
 # temp files for the fingerprint live in this shell, so the EXIT/TERM cleanup knows them
 FPD="$(mktemp "${TMPDIR:-/tmp}/sv-fd.XXXXXX")" && FPU="$(mktemp "${TMPDIR:-/tmp}/sv-fu.XXXXXX")" && FPF="$(mktemp "${TMPDIR:-/tmp}/sv-ff.XXXXXX")" || { led "-" error; msg "Cannot create a temp file; not verified."; exit 0; }
+SDIR="$(mktemp -d "${TMPDIR:-/tmp}/sv-d.XXXXXX")" || { SDIR=""; led "-" error; msg "Cannot create a temp folder; not verified."; exit 0; }   # private: the start marker lives here
 FAIL_TEXT=""; RC=0; PASS_TEXT=""; k=0
 for ROOT in "${UROOTS[@]}"; do
   KEY="${UKEYS[$k]}"; k=$((k + 1))
@@ -312,7 +321,7 @@ for ROOT in "${UROOTS[@]}"; do
 
   LOG="$(mktemp "${TMPDIR:-/tmp}/subagent-verify.XXXXXX")" || { LOG=""; led "$KEY" error; NOTES+="Cannot create a temp file; not verified. "; continue; }
   LIST="$(mktemp "${TMPDIR:-/tmp}/subagent-verify-list.XXXXXX")" || { LIST=""; led "$KEY" error; NOTES+="Cannot create a temp file; not verified. "; continue; }
-  STARTED="$LIST.started"
+  STARTED="$SDIR/started"; /bin/rm -f "$STARTED"
   # the list holds only files that passed validation, for this checkout
   i=0
   while (( i < ${#EF[@]} )); do

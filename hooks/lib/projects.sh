@@ -89,13 +89,18 @@ led_bounded() {  # STATE_DIR field...
 # Otherwise the default ~/.claude/stop-verify.projects.json. (stop-verify.sh itself accepts any
 # absolute path.)
 pick_conf() {
-  local def="$HOME/.claude/stop-verify.projects.json" x="${STOP_VERIFY_CONFIG:-}" d b h
-  if [[ "$x" == /* && -f "$x" && ! -L "$x" ]]; then
-    d="$(cd "$(dirname "$x")" 2>/dev/null && pwd -P)" || { printf '%s' "$def"; return 0; }
-    for b in "$HOME/.claude" "$HOME/.config"; do
-      h="$(cd "$b" 2>/dev/null && pwd -P)" || continue
-      if [[ "$d" == "$h" || "$d" == "$h"/* ]]; then printf '%s' "$d/${x##*/}"; return 0; fi
-    done
+  local def="$HOME/.claude/stop-verify.projects.json" x="${STOP_VERIFY_CONFIG:-}" d f b h
+  if [[ "$x" == /* ]]; then
+    # Resolve the folder physically first, build the final path from it, and run every check on
+    # that final path: it is exactly the path later given to jq.
+    d="$(cd -P "$(dirname "$x")" 2>/dev/null && pwd -P)" || { printf '%s' "$def"; return 0; }
+    f="$d/${x##*/}"
+    if [[ -f "$f" && ! -L "$f" ]]; then
+      for b in "$HOME/.claude" "$HOME/.config"; do
+        h="$(cd -P "$b" 2>/dev/null && pwd -P)" || continue
+        if [[ "$d" == "$h" || "$d" == "$h"/* ]]; then printf '%s' "$f"; return 0; fi
+      done
+    fi
   fi
   printf '%s' "$def"
 }

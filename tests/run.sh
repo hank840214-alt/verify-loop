@@ -833,4 +833,30 @@ sconf 'true' 'cat "$VERIFY_CHANGED_FILE" > "$LISTLOG"; exit 1'; TA="$(agent q9)"
 # 10. colon form of SGR colour
 lconf 'printf "\033[38:2::255:0:0m%s\033[0m: error\n" "$EDIT_FILE"; exit 1'; lpost "$LR/src/a.ts"; lrc "S10: ANSI SGR with colons (true colour) around the path -> block" 2
 
+
+# ---------- third review round ----------
+# 1. STOP_VERIFY_CONFIG: the checked path is the path that is loaded (physical folder, then the file)
+mkdir -p "$T/outpar/outdir"; cp "$T/outcfg/abs.json" "$T/outpar/x.json"; ln -sfn "$T/outpar/outdir" "$HOME/.claude/linkdir"; ln -sf "$T/outcfg/abs.json" "$HOME/.claude/x.json"
+lconf 'echo "$EDIT_FILE: from-default-config"; exit 1'
+PENV=("STOP_VERIFY_CONFIG=$HOME/.claude/linkdir/../x.json"); lpost "$LR/src/a.ts"; PENV=()
+has "T1: linkdir/../x.json (logical path is a link to outside, physical path is outside) is ignored in L1" "$ERR" "from-default-config"
+sconf "$GOODCHK"; setmain BAD; TA="$(agent t1)"; tr_edit "$TA" "$SR/src/main.txt"
+SENV=("STOP_VERIFY_CONFIG=$HOME/.claude/linkdir/../x.json"); pre t1 SubagentHandback; SENV=()
+has "T1: ... and in L2" "$ERR" "FAILED: main.txt lacks OK"
+/bin/rm -f "$HOME/.claude/linkdir" "$HOME/.claude/x.json"
+# 2. L1 total budget leaves room for the work after the watchdog (static: default 18 s, check limit 1..15)
+grep -q '^TOTAL_LIMIT=18$' "$PE" && grep -q "1\.\.15, default 15" "$PE" && ok "T2: L1 default budget is 18 s, limit 1..15" || bad "T2: L1 budget"
+# 3. no start marker next to the mktemp file: nothing in TMPDIR ends in .started while the check runs
+mkdir -p "$T/tmpm"; /bin/rm -f "$T/tmpm"/*; sconf 'true' 'ls -A "$TMPDIR" > "$LISTLOG"; exit 1'; TA="$(agent t3)"; tr_edit "$TA" "$SR/src/main.txt"
+prein t3 SubagentHandback | TMPDIR="$T/tmpm" bash "$SV" >/dev/null 2>&1; RC=$?
+[[ $RC == 2 && -s "$LISTLOG" ]] && ! grep -q 'started' "$LISTLOG" && ok "T3: the start marker is not a derived name in TMPDIR (it lives in a private mktemp -d folder)" || bad "T3: TMPDIR during the run: $(tr '\n' ' ' < "$LISTLOG")"
+[[ -z "$(ls "$T/tmpm")" ]] && ok "T3: ... and the private folder is removed afterwards" || bad "T3: left over: $(ls "$T/tmpm" | tr '\n' ' ')"
+# 4. a Bash call the host/hook refused to run is not a write (text observed in real transcripts)
+sconf "$GOODCHK"; setmain BAD; TA="$(agent t4)"
+jq -nc --arg c "printf x > \"$SRP/src/main.txt\"" '{type:"assistant",cwd:"/tmp",message:{role:"assistant",content:[{type:"tool_use",id:"den1",name:"Bash",input:{command:$c}}]}}' >> "$TA"
+jq -nc '{type:"user",message:{role:"user",content:[{type:"tool_result",tool_use_id:"den1",is_error:true,content:"Permission to use Bash denied by plugin some-plugin: This call was refused: not allowed."}]}}' >> "$TA"
+snap; pre t4 SubagentHandback; schk "T4: Bash call denied before it ran is ignored (no-change, checks not run)" t4 no-change 0 0
+TA="$(agent t4b)"; tr_tool "$TA" Bash "$(jq -nc --arg c "printf x > \"$SRP/src/main.txt\" && false" '{command:$c}')" true /tmp
+snap; pre t4b SubagentHandback; schk "T4: ... while an ordinary failed Bash call still counts" t4b fail 2 1
+
 echo; echo "$pass passed, $fail failed"; (( fail == 0 ))

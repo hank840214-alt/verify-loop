@@ -56,7 +56,7 @@ Both hooks read the same projects file and use the same `roots` trust as the Sto
     "edit_check": {
       "files_re": "^(src|server)/.*\\.(ts|tsx)$",
       "cmd": "npx tsc --noEmit --pretty false",
-      "limit": 20
+      "limit": 15
     },
     "handback_verify": "npx tsc --noEmit && npm test --silent",
     "handback_limit": 420
@@ -64,7 +64,7 @@ Both hooks read the same projects file and use the same `roots` trust as the Sto
 }
 ```
 
-- `edit_check` (layer 1): `files_re` is an extended regex on the repo-relative path; `cmd` is a bash command run at the repo root with `$EDIT_FILE` set to that path; `limit` is in seconds (1..22, default 20). The hook blocks only when `cmd` exits non-zero and some output line names the edited file, as a whole path (repo-relative or absolute). It shows at most 20 such lines. If `cmd` only reports other files, the edit passes. Make the tool print paths relative to the repo root. ANSI colour codes are stripped before matching and `NO_COLOR=1` is set. If `requires` is set and missing, the check is skipped. The matcher only asks whether an output line names the file; it does not parse the diagnostic format, so a status line that mentions the file next to an error in another file can still block.
+- `edit_check` (layer 1): `files_re` is an extended regex on the repo-relative path; `cmd` is a bash command run at the repo root with `$EDIT_FILE` set to that path; `limit` is in seconds (1..15, default 15). The hook blocks only when `cmd` exits non-zero and some output line names the edited file, as a whole path (repo-relative or absolute). It shows at most 20 such lines. If `cmd` only reports other files, the edit passes. Make the tool print paths relative to the repo root. ANSI colour codes are stripped before matching and `NO_COLOR=1` is set. If `requires` is set and missing, the check is skipped. The matcher only asks whether an output line names the file; it does not parse the diagnostic format, so a status line that mentions the file next to an error in another file can still block.
 - `handback_verify` (layer 2): the command run when a subagent that changed this checkout hands in its report. There is no fallback to `verify`; without this field layer 2 does nothing for the project. It fails when it exits non-zero. Exit 124, 126, 127 or a kill by signal means "not verified", and the hand-back goes through. `$VERIFY_CHANGED_FILE` lists the files the subagent wrote with the edit tools.
 - `handback_limit`: seconds before that run is stopped as "not verified" (1..440, default 420; the hook timeout is 480).
 

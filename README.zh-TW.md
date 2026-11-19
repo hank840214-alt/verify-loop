@@ -33,7 +33,7 @@
     "edit_check": {
       "files_re": "^(src|server)/.*\\.(ts|tsx)$",
       "cmd": "npx tsc --noEmit --pretty false",
-      "limit": 20
+      "limit": 15
     },
     "handback_verify": "npx tsc --noEmit && npm test --silent",
     "handback_limit": 420
@@ -41,7 +41,7 @@
 }
 ```
 
-- `edit_check`（第 1 層）：`files_re` 是對「相對 repo 根目錄的路徑」的擴充正規式；`cmd` 是在 repo 根目錄跑的 bash 指令，`$EDIT_FILE` 就是那個路徑；`limit` 單位秒（1..22，預設 20）。只有 `cmd` 結束碼非 0、而且輸出有一行點名剛改的檔（整段路徑，相對或絕對都行）才擋，最多顯示 20 行。`cmd` 只報別的檔，這次編輯就放行。請讓工具印出相對 repo 根目錄的路徑。比對前會去掉 ANSI 色碼，並設 `NO_COLOR=1`。設了 `requires` 而路徑不存在時，檢查會跳過。比對只看「輸出裡有沒有一行提到這個檔」，不解析診斷格式，所以一行提到該檔的狀態訊息，加上另一個檔的錯誤，仍可能擋下。
+- `edit_check`（第 1 層）：`files_re` 是對「相對 repo 根目錄的路徑」的擴充正規式；`cmd` 是在 repo 根目錄跑的 bash 指令，`$EDIT_FILE` 就是那個路徑；`limit` 單位秒（1..15，預設 15）。只有 `cmd` 結束碼非 0、而且輸出有一行點名剛改的檔（整段路徑，相對或絕對都行）才擋，最多顯示 20 行。`cmd` 只報別的檔，這次編輯就放行。請讓工具印出相對 repo 根目錄的路徑。比對前會去掉 ANSI 色碼，並設 `NO_COLOR=1`。設了 `requires` 而路徑不存在時，檢查會跳過。比對只看「輸出裡有沒有一行提到這個檔」，不解析診斷格式，所以一行提到該檔的狀態訊息，加上另一個檔的錯誤，仍可能擋下。
 - `handback_verify`（第 2 層）：改過這個 checkout 的子代理交報告時跑的指令，沒有退回 `verify` 的備援：沒填這個欄位，第 2 層就不碰該專案。結束碼非 0 算失敗；124、126、127 或被訊號殺掉算「沒驗完」，交報告照常通過。`$VERIFY_CHANGED_FILE` 列出子代理用編輯工具寫過的檔。
 - `handback_limit`：這次執行的秒數上限，超過算「沒驗完」（1..440，預設 420；hook timeout 是 480）。
 

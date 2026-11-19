@@ -15,7 +15,7 @@
 # "roots" trust. Optional field per project:
 #   "edit_check": { "files_re": "<ERE on the repo-relative path>",
 #                   "cmd":      "<bash, run at the repo root; $EDIT_FILE = repo-relative path>",
-#                   "limit":    20 }          # seconds, 1..22, default 20
+#                   "limit":    15 }          # seconds, 1..15, default 15
 # No edit_check -> this hook does nothing for that project. "requires" (a path that must exist
 # under the repo root, as for stop-verify.sh) is honoured: if it is missing, the check is skipped.
 #
@@ -24,8 +24,9 @@
 # the check runs with NO_COLOR=1. The matcher only asks "does an output line name this file?";
 # it does not parse the diagnostic format. At most 20 diagnostic lines are shown.
 #
-# The whole hook, including reading stdin, runs under a 25 s budget (the plugin hook timeout is
-# 30). The inner process is started by us with --inner; an inherited variable cannot skip the
+# The whole hook, including reading stdin, runs under an 18 s budget (the plugin hook timeout is
+# 30; after the budget the hook may still spend up to 2 s on jq, 3 s on the ledger, 2 s on the
+# notice and a TERM grace, so it ends with room to spare). The inner process is started by us with --inner; an inherited variable cannot skip the
 # watchdog, and a TERM to the hook is forwarded to the check's process group.
 # Test-only overrides POST_EDIT_STATE and POST_EDIT_LIMIT are ignored when this script lives
 # under ~/.claude (an installed copy or plugin). They never touch trust: trust is only "roots".
@@ -40,11 +41,11 @@ source "$SELF_DIR/lib/projects.sh" 2>/dev/null || exit 0
 CONF="$(pick_conf)"
 [[ -f "$CONF" ]] || exit 0
 STATE_DIR="$HOME/.claude/state/post-edit-check"
-TOTAL_LIMIT=25
+TOTAL_LIMIT=18
 CLAUDE_HOME="$(cd "$HOME/.claude" 2>/dev/null && pwd -P)"
 if [[ -z "$CLAUDE_HOME" || "$SELF_DIR" != "$CLAUDE_HOME"/* ]]; then
   STATE_DIR="${POST_EDIT_STATE:-$STATE_DIR}"
-  [[ "${POST_EDIT_LIMIT:-}" =~ ^[0-9]{1,3}$ ]] && TOTAL_LIMIT=$((10#$POST_EDIT_LIMIT)) && (( TOTAL_LIMIT >= 1 )) || TOTAL_LIMIT=25
+  [[ "${POST_EDIT_LIMIT:-}" =~ ^[0-9]{1,3}$ ]] && TOTAL_LIMIT=$((10#$POST_EDIT_LIMIT)) && (( TOTAL_LIMIT >= 1 )) || TOTAL_LIMIT=18
 fi
 INNER=0; for a in "$@"; do [[ "$a" == --inner ]] && INNER=1; done
 
@@ -106,7 +107,7 @@ if ! printf '%s' "$EC" | jq -e 'type == "object" and (.files_re | type) == "stri
   soft error "edit_check in the projects file needs files_re and cmd (strings) and an optional numeric limit"
 fi
 FILES_RE="$(printf '%s' "$EC" | jq -r '.files_re')"; CMD="$(printf '%s' "$EC" | jq -r '.cmd')"
-LIMIT="$(printf '%s' "$EC" | jq -r '.limit // 20 | floor')"
+LIMIT="$(printf '%s' "$EC" | jq -r '.limit // 15 | floor')"
 [[ -n "$FILES_RE" && -n "$CMD" ]] || soft error "edit_check files_re and cmd must not be empty"
 re_ok "$FILES_RE" || soft error "edit_check files_re is not a valid regex"
 [[ "$REL" =~ $FILES_RE ]] || exit 0

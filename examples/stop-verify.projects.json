@@ -11,7 +11,7 @@
     "edit_check": {
       "files_re": "^(src|server)/.*\\.(ts|tsx)$",
       "cmd": "npx tsc --noEmit --pretty false",
-      "limit": 20
+      "limit": 15
     },
     "handback_verify": "npx tsc --noEmit && npm test --silent",
     "handback_limit": 420
