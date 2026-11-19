@@ -11,7 +11,8 @@
 #            timeout / error and shown as a systemMessage; they never block.
 #
 # Config: the same projects file as stop-verify.sh (~/.claude/stop-verify.projects.json, or
-# $STOP_VERIFY_CONFIG when that is an absolute path), same "roots" trust. Optional field per project:
+# $STOP_VERIFY_CONFIG when that is an absolute path to a file under ~/.claude or ~/.config), same
+# "roots" trust. Optional field per project:
 #   "edit_check": { "files_re": "<ERE on the repo-relative path>",
 #                   "cmd":      "<bash, run at the repo root; $EDIT_FILE = repo-relative path>",
 #                   "limit":    20 }          # seconds, 1..22, default 20
@@ -31,11 +32,12 @@
 # Ledger: ~/.claude/state/post-edit-check/ledger.tsv  (time, project, file, result, seconds)
 #   result: pass | block | timeout | skip | error
 set -uo pipefail
+START=$SECONDS
 SELF="${BASH_SOURCE[0]}"
 SELF_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd -P)"
-START=$SECONDS
-CONF="$HOME/.claude/stop-verify.projects.json"
-[[ "${STOP_VERIFY_CONFIG:-}" == /* ]] && CONF="$STOP_VERIFY_CONFIG"   # a relative path is ignored
+# shellcheck source=lib/projects.sh
+source "$SELF_DIR/lib/projects.sh" 2>/dev/null || exit 0
+CONF="$(pick_conf)"
 [[ -f "$CONF" ]] || exit 0
 STATE_DIR="$HOME/.claude/state/post-edit-check"
 TOTAL_LIMIT=25
@@ -45,13 +47,11 @@ if [[ -z "$CLAUDE_HOME" || "$SELF_DIR" != "$CLAUDE_HOME"/* ]]; then
   [[ "${POST_EDIT_LIMIT:-}" =~ ^[0-9]{1,3}$ ]] && TOTAL_LIMIT=$((10#$POST_EDIT_LIMIT)) && (( TOTAL_LIMIT >= 1 )) || TOTAL_LIMIT=25
 fi
 INNER=0; for a in "$@"; do [[ "$a" == --inner ]] && INNER=1; done
-# shellcheck source=lib/projects.sh
-source "$SELF_DIR/lib/projects.sh" 2>/dev/null || exit 0
 
 led() {  # project, file, result, seconds
   ledger_append "$STATE_DIR" "$1" "$2" "$3" "$4"
 }
-note() { jq -cn --arg m "[post-edit-check] $1" '{systemMessage:$m}' 2>/dev/null; }
+note() { run_limited 2 jq -cn --arg m "[post-edit-check] $1" '{systemMessage:$m}' 2>/dev/null; }
 WARN='{"systemMessage":"[post-edit-check] %s; edit check skipped"}\n'
 
 # ---------- outer: watchdog around the whole decision ----------
@@ -68,7 +68,7 @@ if (( INNER == 0 )); then
   LEFT=$((TOTAL_LIMIT - (SECONDS - START))); (( LEFT >= 1 )) || LEFT=1
   printf '%s' "$INPUT" | run_limited "$LEFT" bash "$SELF" --inner >"$OUTF" 2>"$ERRF"; RC=$?
   if (( RC == 124 || (RC != 0 && RC != 2) )); then
-    F="$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null)"
+    F="$(printf '%s' "$INPUT" | run_limited 2 jq -r '.tool_input.file_path // empty' 2>/dev/null)"
     if (( RC == 124 )); then led_bounded "$STATE_DIR" "-" "$F" timeout "$((SECONDS - START))"; note "Edit check timed out (${TOTAL_LIMIT} s); not verified."
     else led_bounded "$STATE_DIR" "-" "$F" error "$((SECONDS - START))"; note "Edit check failed by itself (rc=${RC}); not verified."; fi
     exit 0
@@ -131,7 +131,7 @@ HITS="$(perl -e '
   my ($rel, $abs) = @ARGV;
   while (my $l = <STDIN>) {
     chomp $l;
-    (my $c = $l) =~ s/\e\[[0-9;?]*[ -\/]*[@-~]//g;
+    (my $c = $l) =~ s/\e\[[0-9;:?]*[ -\/]*[@-~]//g;
     for my $n ($abs, $rel) {
       next if !defined $n || $n eq "";
       if ($c =~ /(?<![\w.\/@~-])(?:\.\/)?\Q$n\E(?![\w\/~-]|\.\w)/) { print "$c\n"; last }

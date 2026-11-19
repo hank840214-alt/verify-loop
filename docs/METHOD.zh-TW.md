@@ -27,7 +27,7 @@ Lauren Tan 的倒金字塔（便宜、可信的在前）：程式碼設計 → �
    - **口味**（字太多、像 AI）→ `DESIGN.md`＋截圖、影片、試聽。
 4. **只是某件事的做法？** → skill 或腳本。專案規則放 repo，每個 AI 都看得到。
 
-Hook：檢查失敗一定 `exit 2`（exit 1 會被當成完成）。hook 逾時＝沒檢查，所以停止 hook 自設低於 hook timeout 的總時限。失敗或沒跑完，同一個確切狀態只擋一次；之後 Claude 可以收工，並看到 NOT VERIFIED。每次判定都追加到 `~/.claude/state/stop-verify/ledger.tsv`（只在本機、不含路徑）。有子代理、workflow 或 `codex-dispatch.sh` 在跑時先不檢查，等下一次收工再跑。更早還有兩層，讀同一份專案檔：PostToolUse hook 每次改檔後跑快速檢查，只在被改的那個檔有錯時才擋；`SubagentHandback` 的 PreToolUse hook 在改過受信任 checkout 的子代理交報告前，先跑專案的檢查。hook 自己壞掉（沒有 `jq`）就 exit 0 加提醒，不卡住 session。
+Hook：檢查失敗一定 `exit 2`（exit 1 會被當成完成）。hook 逾時＝沒檢查，所以停止 hook 自設低於 hook timeout 的總時限。失敗或沒跑完，同一個確切狀態只擋一次；之後 Claude 可以收工，並看到 NOT VERIFIED。每次判定都追加到 `~/.claude/state/stop-verify/ledger.tsv`（只在本機、不含路徑）。有子代理、workflow 或 `codex-dispatch.sh` 在跑時先不檢查，等下一次收工再跑。更早還有兩層，讀同一份專案檔：PostToolUse hook 每次改檔後跑快速檢查，檢查失敗而且輸出裡有一行點名被改的那個檔時才擋（不解析診斷格式）；`SubagentHandback` 的 PreToolUse hook 在改過受信任 checkout 的子代理交報告前，先跑專案的檢查。hook 自己壞掉（沒有 `jq`）就 exit 0 加提醒，不卡住 session。
 
 ## 二、誰看什麼
 - 人只看**成品**：前後截圖、短片、狀態圖、「修前失敗、修後通過」紀錄。用功能地圖的固定名稱溝通。

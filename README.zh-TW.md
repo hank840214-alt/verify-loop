@@ -23,7 +23,7 @@
 
 ### 每次改檔後的快速檢查，與子代理交報告前的檢查
 
-兩個 hook 讀同一份專案檔、用同樣的 `roots` 信任方式。它們是選擇加入的：專案沒填 `edit_check`，第 1 層就不碰它；沒填 `handback_verify`，第 2 層就不碰它（不會拿停止 hook 的 `verify` 來跑）。兩個 hook 都以你的身分、在 Claude Code 沙盒外執行你的指令，而且時機是停止 hook 沒有的：第 1 層在每次符合的改檔後，第 2 層在改過 checkout 的子代理交報告時。`$STOP_VERIFY_CONFIG` 只有在它是絕對路徑時才採用。
+兩個 hook 讀同一份專案檔、用同樣的 `roots` 信任方式。它們是選擇加入的：專案沒填 `edit_check`，第 1 層就不碰它；沒填 `handback_verify`，第 2 層就不碰它（不會拿停止 hook 的 `verify` 來跑）。兩個 hook 都以你的身分、在 Claude Code 沙盒外執行你的指令，而且時機是停止 hook 沒有的：第 1 層在每次符合的改檔後，第 2 層在改過 checkout 的子代理交報告時。這兩個 hook 只有在 `$STOP_VERIFY_CONFIG` 是指向一般檔案（不是連結）的絕對路徑，而且位於 `~/.claude` 或 `~/.config` 底下時才採用；否則用 `~/.claude/stop-verify.projects.json`。停止 hook 仍接受任何絕對路徑。
 
 ```json
 {
@@ -60,6 +60,9 @@
 - 第 2 層面對的是共用的 checkout。失敗可能來自別的 session 的改動，所以擋下時的訊息會這樣說，並要求子代理不要去還原不是自己的改動。
 - 第 2 層靠字串比對（`>`、`sed -i`、`mv`、`git checkout` 等）加路徑名稱，找出子代理用 Bash 寫的檔。可能漏掉，也可能把無害的指令算進去。唯讀的 git（`status`、`log`、`diff`、`show`、`stash list`）不算寫入。
 - 第 2 層不管子代理改的是哪個檔，都會跑完整的 `handback_verify`。
+- Bash 指令裡的 `=` 與 `:` 都算路徑的起點，所以像 `/tmp/archive=<root>/x` 這種奇怪的路徑，仍可能選中受信任的 checkout `<root>`。
+- 第 2 層用 git 取得 checkout 的指紋。repo 裡設定的 clean 或 smudge filter，可能在 git 讀檔時執行。
+- 舊的封鎖紀錄（`<session>.<agent>.blocked`）30 天後刪除；超過這段時間才續接的子代理，封鎖次數會重新計算。
 - 兩個 hook 都是先檢查信任、稍後才啟動指令。若中間有人把 linked worktree 換成 symlink，指令可能在錯的位置執行。這個競態沒有防禦。
 - Codex 唯讀模式仍讀得到你帳號能讀的所有檔案；派工腳本限制的是寫入和網路，不是讀取。
 - 「預設斷網」是派工腳本傳給 Codex 的設定（`sandbox_workspace_write.network_access=false`）；測試只檢查有傳這個設定，沒測實際連線。請在你的 Codex 版本上確認一次。

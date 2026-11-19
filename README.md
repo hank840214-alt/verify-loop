@@ -46,7 +46,7 @@ Copy `examples/stop-verify.projects.json` to `~/.claude/stop-verify.projects.jso
 Optional `skip_re` names files that never trigger a run (generated files, leftovers of killed tests). Each verdict is appended to `~/.claude/state/stop-verify/ledger.tsv` (local, never printed, no full paths). Checks are skipped while a subagent, workflow or `codex-dispatch.sh` is running and happen at the next stop. `STOP_VERIFY_DEADLINE` (120..540 s, default 540) is the total time budget. To force a re-run of a failed state, change a file or delete `<state dir>/<id>.red`. `VERIFY_CHANGED_FILE` is newline-separated, so file names with newlines are not supported.
 
 ### Quick check after each edit, and a check before a subagent reports
-Both hooks read the same projects file and use the same `roots` trust as the Stop hook. They are opt-in: a project without `edit_check` is left alone by layer 1, and a project without `handback_verify` is left alone by layer 2 (its Stop-hook `verify` is never run by layer 2). Each hook runs your command as your user, outside Claude Code's sandbox, at a time the Stop hook did not: layer 1 after every matching edit, layer 2 when a subagent that changed a checkout hands in its report. `$STOP_VERIFY_CONFIG` is used only when it is an absolute path.
+Both hooks read the same projects file and use the same `roots` trust as the Stop hook. They are opt-in: a project without `edit_check` is left alone by layer 1, and a project without `handback_verify` is left alone by layer 2 (its Stop-hook `verify` is never run by layer 2). Each hook runs your command as your user, outside Claude Code's sandbox, at a time the Stop hook did not: layer 1 after every matching edit, layer 2 when a subagent that changed a checkout hands in its report. These two hooks use `$STOP_VERIFY_CONFIG` only when it is an absolute path to a regular file (not a link) under `~/.claude` or `~/.config`; otherwise they use `~/.claude/stop-verify.projects.json`. The Stop hook still accepts any absolute path.
 
 ```json
 {
@@ -107,6 +107,9 @@ bash tests/run.sh
 - Layer 2 works on shared checkouts. A failure can come from another session's edit, so the block message says so and tells the subagent not to revert work that is not its own.
 - Layer 2 finds a subagent's Bash writes by matching strings (`>`, `sed -i`, `mv`, `git checkout`, and so on) and path names. It can miss a write, and it can count a harmless command. Read-only git (`status`, `log`, `diff`, `show`, `stash list`) does not count.
 - Layer 2 runs the whole `handback_verify` command, whatever file the subagent changed.
+- In a Bash command, `=` and `:` count as the start of a path, so an odd path such as `/tmp/archive=<root>/x` can still select the trusted checkout `<root>`.
+- Layer 2 fingerprints the checkout with git. Clean or smudge filters configured in the repo may run while git reads files.
+- Old block records (`<session>.<agent>.blocked`) are deleted after 30 days; an agent that resumes later gets a fresh block count.
 - Both hooks check trust, then start the command later. If someone swaps a linked worktree for a symlink in between, the command can run in the wrong place. That race is not defended against.
 - Codex in read-only mode can still read any file your user can read. The wrapper limits writes and network, not reads.
 - "Network off" is a Codex setting the wrapper passes (`sandbox_workspace_write.network_access=false`); the tests check the flag, not real traffic. Check it once on your Codex version.

@@ -637,6 +637,7 @@ CV="$(awk -F'\t' '$3 == "g1" {print $4}' "$SL" | sort | uniq -c | tr -s ' ' | tr
 [[ "$CRC" == "0 0 0 2 " ]] && ok "L2: 4 concurrent calls -> exit codes exactly 0,0,0,2" || bad "L2: concurrency exit codes '$CRC'"
 [[ "$(wc -l < "$SL" | tr -d ' ')" == "$((R0 + 4))" && "$CV" == " 1 fail; 3 repeat;" ]] && ok "L2: ... four new ledger rows: one fail, three repeat" || bad "L2: concurrency ledger '$CV'"
 [[ "$(wc -l < "$HOME/.claude/state/subagent-verify/sPre.g1.blocked" | tr -d ' ')" == 1 && ! -d "$HOME/.claude/state/subagent-verify/sPre.g1.lock" ]] && ok "L2: ... one block record, lock released" || bad "L2: concurrency record/lock"
+[[ "$(awk -F'\t' 'NF != 5 || $1 !~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}T/ {n++} END {print n + 0}' "$SL")" == 0 ]] && ok "R3b: every ledger row is whole (5 fields, one timestamp) after the concurrent writes" || bad "R3b: damaged ledger row"
 # config gates
 rm -f "$SC"; TA="$(agent h1)"; tr_edit "$TA" "$SR/src/main.txt"; pre h1 SubagentHandback; [[ "$RC" == 0 && -z "$OUT" ]] && ok "L2: no config file -> 0, silent" || bad "L2: no config"
 echo '{}' > "$SC"; pre h1 SubagentHandback; [[ "$RC" == 0 && "$(lastled "$SL" 4)" == no-change ]] && ok "L2: repo not in config -> 0 (no-change)" || bad "L2: unregistered ($(tail -1 "$SL"))"
@@ -670,8 +671,12 @@ mkdir -p "$T/relcfg"; jq -n --arg r "$LRP" '{"acme/lapp":{roots:[$r],edit_check:
 lconf 'echo "$EDIT_FILE: from-default-config"; exit 1'
 PCWD="$T/relcfg"; PENV=(STOP_VERIFY_CONFIG=rel.json); lpost "$LR/src/a.ts"; PENV=(); PCWD="."
 [[ $RC == 2 ]] && has "R2: relative STOP_VERIFY_CONFIG is ignored (default config used)" "$ERR" "from-default-config" || bad "R2: relative STOP_VERIFY_CONFIG (rc=$RC)"
-cp "$T/relcfg/rel.json" "$T/abs.json"; PENV=("STOP_VERIFY_CONFIG=$T/abs.json"); lpost "$LR/src/a.ts"; PENV=()
-has "R2: an absolute STOP_VERIFY_CONFIG is still honoured" "$ERR" "from-relative-config"
+mkdir -p "$HOME/.config" "$T/outcfg"; cp "$T/relcfg/rel.json" "$HOME/.config/abs.json"; cp "$T/relcfg/rel.json" "$HOME/.claude/abs2.json"; cp "$T/relcfg/rel.json" "$T/outcfg/abs.json"; ln -sf "$T/outcfg/abs.json" "$HOME/.config/lnk.json"
+PENV=("STOP_VERIFY_CONFIG=$HOME/.config/abs.json"); lpost "$LR/src/a.ts"; PENV=()
+has "R2/R11b: an absolute STOP_VERIFY_CONFIG under ~/.config is still honoured" "$ERR" "from-relative-config"
+PENV=("STOP_VERIFY_CONFIG=$HOME/.claude/abs2.json"); lpost "$LR/src/a.ts"; PENV=(); has "R2/R11b: ... and under ~/.claude" "$ERR" "from-relative-config"
+PENV=("STOP_VERIFY_CONFIG=$T/outcfg/abs.json"); lpost "$LR/src/a.ts"; PENV=(); has "R11b: an absolute STOP_VERIFY_CONFIG outside ~/.claude and ~/.config is ignored" "$ERR" "from-default-config"
+PENV=("STOP_VERIFY_CONFIG=$HOME/.config/lnk.json"); lpost "$LR/src/a.ts"; PENV=(); has "R11b: ... and a link there that points outside is ignored" "$ERR" "from-default-config"
 sconf "$GOODCHK"; setmain BAD; TA="$(agent r2a)"; tr_edit "$TA" "$SR/src/main.txt"
 SCWD="$T/relcfg"; SENV=(STOP_VERIFY_CONFIG=rel.json); jq -n --arg r "$SRP" '{"acme/svapp":{roots:[$r],handback_verify:"echo from-relative-config; exit 1"}}' > "$T/relcfg/rel.json"; pre r2a SubagentHandback; SENV=(); SCWD="."
 has "R2: layer 2 ignores a relative STOP_VERIFY_CONFIG too" "$ERR$OUT" "FAILED: main.txt lacks OK"
@@ -702,9 +707,10 @@ TMPDIR="$OR/tmp" run_limited 3 bash "$SV" < "$T/in.l2" >/dev/null 2>&1; RC=$?; s
 ! kill -0 "$(cat "$T/pid.b" 2>/dev/null || echo 0)" 2>/dev/null && ok "R4: L2 the verifier's child is not left running" || { bad "R4: L2 orphan survived"; kill "$(cat "$T/pid.b")" 2>/dev/null; }
 [[ -z "$(ls "$OR/tmp")" ]] && ok "R4: L2 temp files removed after the kill" || bad "R4: L2 temp files left: $(ls "$OR/tmp")"
 # L1: the check's limit is capped by the time left, so a slow start cannot push it past the budget
-printf '#!/bin/bash\nsleep 2\nexec /usr/bin/env -i PATH="%s" git "$@"\n' "$PATH" > "$T/gitshim/git"; chmod +x "$T/gitshim/git"
+printf '#!/bin/bash\nsleep 1\nexec /usr/bin/env -i PATH="%s" git "$@"\n' "$PATH" > "$T/gitshim/git"; chmod +x "$T/gitshim/git"
 lconf 'sleep 20' '^src/' 20; T0=$SECONDS; PENV=("PATH=$T/gitshim:$PATH" POST_EDIT_LIMIT=7); lpost "$LR/src/a.ts"; PENV=(); EL=$((SECONDS - T0))
-[[ $RC == 0 && "$(lastled "$LL" 4)" == timeout ]] && (( EL <= 8 )) && ok "R4: L1 limit is cut to the remaining budget (inner timeout in ${EL}s)" || bad "R4: L1 remaining budget (rc=$RC ${EL}s $(tail -1 "$LL"))"
+[[ $RC == 0 && "$(lastled "$LL" 4)" == timeout && "$(lastled "$LL" 2)" == acme/lapp ]] && (( EL <= 8 )) && ok "R4/R12: L1 limit is cut to the remaining budget (the inner check logged the project's timeout in ${EL}s)" || bad "R4: L1 remaining budget (rc=$RC ${EL}s $(tail -1 "$LL"))"
+hasnt "R4/R12: ... and the outer watchdog message is absent" "$OUT" "Edit check timed out"
 /bin/rm -f "$T/gitshim/git"
 # 5. stdin that never ends is bounded
 T0=$SECONDS
@@ -714,7 +720,7 @@ T0=$SECONDS; ( bash "$SV" < <(printf '{"hook_event_name":"PreToolUse","tool_name
 [[ $RC == 0 ]] && (( EL <= 9 )) && has "R5: L2 stdin never closes -> back in ${EL}s, exit 0, warning" "$(cat "$T/sout")" "stdin was not complete" || bad "R5: L2 stdin bound (rc=$RC ${EL}s)"
 # 6. VERIFY_CHANGED_FILE: only validated files of this checkout
 sconf 'true' 'cat "$VERIFY_CHANGED_FILE" > "$LISTLOG"; exit 1'; setmain BAD
-echo z > "$SR/src/new.txt"; ln -s "$SUP/src/main.txt" "$SR/src/lnk2.txt"; printf q > "$SR/src/nl
+echo OK > "$SU/src/main.txt"; echo z > "$SR/src/new.txt"; ln -s "$SUP/src/main.txt" "$SR/src/lnk2.txt"; printf q > "$SR/src/nl
 name.txt"
 TA="$(agent r6)"; tr_edit "$TA" "$SR/src/main.txt"; tr_edit "$TA" "$SR/src/new.txt"; tr_edit "$TA" "$SR/src/lnk2.txt"; tr_edit "$TA" "$SR/src/gone.txt"; tr_edit "$TA" "$SUP/src/main.txt"; tr_edit "$TA" "$SR/src/nl
 name.txt"
@@ -743,11 +749,12 @@ else ok "R8: (skipped as root: chmod 000 does not stop root)"; fi
 sconf "$GOODCHK"; setmain BAD; TA="$(agent r9)"; tr_tool "$TA" Bash "$(jq -nc --arg c "printf x > \"$SRP/src/main.txt\" && false" '{command:$c}')" true /tmp
 snap; pre r9 SubagentHandback; schk "R9: Bash with is_error:true still counts as a possible write (run, fail, exit 2)" r9 fail 2 1
 TA="$(agent r9b)"; jq -nc '{type:"assistant",cwd:{},message:{content:[{type:"tool_use",id:"z1",name:"Bash",input:{command:"echo hi > f"}}]}}' >> "$TA"
+jq -nc '{type:"user",message:{role:"user",content:[{type:"tool_result",tool_use_id:"z1",is_error:false,content:"ok"}]}}' >> "$TA"
 snap; pre r9b SubagentHandback; schk "R9: transcript the extraction cannot read -> error row (not no-change), exit 0" r9b error 0 0; has "R9: ... not verified note" "$OUT" "not verified"
 # 10. left boundary of the path in a Bash command
 TA="$(agent r10)"; tr_bash "$TA" "printf x > /tmp/backup$SRP/src/main.txt" /tmp; snap; pre r10 SubagentHandback
 schk "R10: /tmp/backup<root>/x does not select <root>" r10 no-change 0 0
-TA="$(agent r10b)"; tr_bash "$TA" "FOO=$SRP/src/x; printf x > \$FOO" /tmp; snap; pre r10b SubagentHandback
+TA="$(agent r10b)"; tr_bash "$TA" "FOO=\"$SRP/src/x\"; printf x > \"\$FOO\"" /tmp; snap; pre r10b SubagentHandback
 schk "R10: NAME=<root>/x (after =) still selects the root" r10b fail 2 1
 # 11. layer 1 matching details
 lconf 'printf "\033[96m%s\033[0m: error\n" "$EDIT_FILE"; exit 1'; lpost "$LR/src/a.ts"; lrc "R11: ANSI colour around the path does not hide it -> block" 2
@@ -758,9 +765,11 @@ lconf 'touch "$LMARK"; echo "$EDIT_FILE: x"; exit 1'; jq '.["acme/lapp"].require
 [[ $RC == 0 && ! -e "$LMARK" && "$(lastled "$LL" 4)" == skip ]] && ok "R12: L1 requires missing -> check not run, ledger skip" || bad "R12: L1 requires (rc=$RC)"
 mkdir -p "$LR/node_modules"; lpost "$LR/src/a.ts"; lrc "R12: ... with requires present it runs" 2; rmdir "$LR/node_modules"
 # P3: prune old block records; agent_transcript_path kept; jq / perl missing
-sconf "$GOODCHK"; mkdir -p "$HOME/.claude/state/subagent-verify"; touch -t 202001010000 "$HOME/.claude/state/subagent-verify/old.blocked"; touch "$HOME/.claude/state/subagent-verify/fresh.blocked"
+sconf "$GOODCHK"; SD2="$HOME/.claude/state/subagent-verify"; mkdir -p "$SD2/sub"
+age() { perl -e 'my $t = time - $ARGV[1] * 86400; utime $t, $t, $ARGV[0]' "$1" "$2"; }
+for f in sOld.aOld.blocked sMid.aMid.blocked old.blocked sub/sX.aX.blocked; do echo x > "$SD2/$f"; done; age "$SD2/sOld.aOld.blocked" 31; age "$SD2/sMid.aMid.blocked" 10; age "$SD2/old.blocked" 40; age "$SD2/sub/sX.aX.blocked" 40
 TA="$(agent p3)"; tr_edit "$TA" "$SR/src/main.txt"; pre p3 SubagentHandback
-[[ ! -e "$HOME/.claude/state/subagent-verify/old.blocked" && -e "$HOME/.claude/state/subagent-verify/fresh.blocked" ]] && ok "P3: *.blocked older than 7 days is pruned, recent one kept" || bad "P3: prune"
+[[ ! -e "$SD2/sOld.aOld.blocked" && -e "$SD2/sMid.aMid.blocked" && -e "$SD2/old.blocked" && -e "$SD2/sub/sX.aX.blocked" ]] && ok "R4b/P3: block records are pruned after 30 days, only own-pattern files in the state folder itself" || bad "P3: prune"
 TA="$(agent p3b)"; tr_edit "$TA" "$SR/src/main.txt"; setmain BAD
 jq -nc --arg t "$TA" --arg c "$SRP" '{session_id:"sNone",transcript_path:"/nonexistent/x.jsonl",cwd:$c,agent_id:"p3b",agent_transcript_path:$t,hook_event_name:"PreToolUse",tool_name:"SubagentHandback"}' | bash "$SV" >/dev/null 2>"$T/serr"; RC=$?
 lrc "P3: agent_transcript_path on a PreToolUse input is used when present" 2
@@ -773,5 +782,55 @@ OUT="$(jq -nc --arg f "$LR/src/a.ts" '{tool_name:"Edit",tool_input:{file_path:$f
 OUT="$(prein p3 SubagentHandback | env PATH="$NJ" /bin/bash "$SV" 2>&1)"; has "P3: L2 without jq -> fixed warning" "$OUT" "jq missing"
 OUT="$(prein p3 SubagentHandback | env PATH="$T/noperl" /bin/bash "$SV" 2>&1)"; has "P3: L2 without perl -> fixed warning" "$OUT" "perl missing"
 OUT="$(prein p3 Bash | env PATH="$NJ" /bin/bash "$SV" 2>&1)"; [[ -z "$OUT" ]] && ok "P3: L2 other tool without jq stays silent" || bad "P3: L2 other tool warns: $OUT"
+
+
+# ---------- second review round ----------
+# 1. a check that ignores TERM, with a grandchild that ignores it too: nothing survives a host kill
+/bin/rm -f "$T/pid.c"; sconf "$GOODCHK" 'trap "" TERM; ( trap "" TERM; sleep 316 & echo $! > "$RUNDIR/pid.c"; wait ) & wait' 60; setmain BAD
+TA="$(agent q1)"; tr_edit "$TA" "$SR/src/main.txt"; prein q1 SubagentHandback > "$T/in.q1"; /bin/rm -f "$OR/tmp"/*
+TMPDIR="$OR/tmp" run_limited 3 bash "$SV" < "$T/in.q1" >/dev/null 2>&1; RC=$?; sleep 1
+! kill -0 "$(cat "$T/pid.c" 2>/dev/null || echo 0)" 2>/dev/null && ok "S1: L2 a verifier and grandchild that ignore TERM are KILLed (inner supervisor kills first)" || { bad "S1: L2 TERM-ignoring grandchild survived"; kill -9 "$(cat "$T/pid.c")" 2>/dev/null; }
+/bin/rm -f "$T/pid.c"; lconf 'trap "" TERM; ( trap "" TERM; sleep 317 & echo $! > "$RUNDIR/pid.c"; wait ) & wait' '^src/' 20
+TMPDIR="$OR/tmp" run_limited 3 bash "$PE" < "$T/in.l1" >/dev/null 2>&1; sleep 1
+! kill -0 "$(cat "$T/pid.c" 2>/dev/null || echo 0)" 2>/dev/null && ok "S1: L1 a check and grandchild that ignore TERM are KILLed" || { bad "S1: L1 TERM-ignoring grandchild survived"; kill -9 "$(cat "$T/pid.c")" 2>/dev/null; }
+# 2. a Bash call with no result at all is not a write
+sconf "$GOODCHK"; setmain BAD; TA="$(agent q2)"; jq -nc --arg c "printf x > \"$SRP/src/main.txt\"" '{type:"assistant",cwd:"/tmp",message:{role:"assistant",content:[{type:"tool_use",id:"nores1",name:"Bash",input:{command:$c}}]}}' >> "$TA"
+snap; pre q2 SubagentHandback; schk "S2: Bash tool_use without any tool_result is ignored (no-change, checks not run)" q2 no-change 0 0
+# 5. TERM during fingerprinting leaves no sv-* files
+mkdir -p "$T/fpshim"; printf '#!/bin/bash\ncase " $* " in *" diff "*) sleep 30;; esac\nexec "%s" "$@"\n' "$(command -v git)" > "$T/fpshim/git"; chmod +x "$T/fpshim/git"
+sconf "$GOODCHK"; TA="$(agent q5)"; tr_edit "$TA" "$SR/src/main.txt"; prein q5 SubagentHandback > "$T/in.q5"; /bin/rm -f "$OR/tmp"/*
+PATH="$T/fpshim:$PATH" TMPDIR="$OR/tmp" run_limited 3 bash "$SV" < "$T/in.q5" >/dev/null 2>&1; sleep 1
+[[ -z "$(ls "$OR/tmp")" ]] && ok "S5: TERM while fingerprinting leaves no sv-* temp files" || bad "S5: temp files left: $(ls "$OR/tmp" | tr '\n' ' ')"
+/bin/rm -rf "$T/fpshim"
+# 6. the verifier did not start: log cannot be opened / checkout cannot be entered
+if [[ "$(id -u)" != 0 ]]; then
+  mkdir -p "$T/mkshim"; printf '#!/bin/bash\nf="$("%s" "$@")" || exit 1\ncase "$1" in *subagent-verify.XXXXXX) chmod 000 "$f";; esac\nprintf "%%s\\n" "$f"\n' "$(command -v mktemp)" > "$T/mkshim/mktemp"; chmod +x "$T/mkshim/mktemp"
+  sconf "$GOODCHK"; setmain BAD; TA="$(agent q6)"; tr_edit "$TA" "$SR/src/main.txt"; snap; SENV=("PATH=$T/mkshim:$PATH"); pre q6 SubagentHandback; SENV=()
+  schk "S6: log file cannot be opened -> the check did not start: error row, exit 0, never a block" q6 error 0 0
+  printf '#!/bin/bash\n"%s" "$@"; rc=$?\ncase " $* " in *" ls-files "*) chmod 000 "$CHMODDIR";; esac\nexit $rc\n' "$(command -v git)" > "$T/mkshim/git"; chmod +x "$T/mkshim/git"
+  TA="$(agent q6b)"; tr_edit "$TA" "$SR/src/main.txt"; snap; SENV=("PATH=$T/mkshim:$PATH" "CHMODDIR=$SRP"); pre q6b SubagentHandback; SENV=(); chmod 755 "$SRP"
+  schk "S6: checkout cannot be entered after the listing -> error row, exit 0 (NOSTART path)" q6b error 0 0
+  /bin/rm -rf "$T/mkshim"
+else ok "S6: (skipped as root)"; fi
+# 7. no perl: warn and leave before reading stdin
+T0=$SECONDS; OUT="$(env PATH="$T/noperl" /bin/bash "$SV" < <(sleep 20) 2>&1)"; EL=$((SECONDS - T0))
+[[ "$OUT" == *"perl missing"* ]] && (( EL <= 4 )) && ok "S7: L2 without perl warns before reading stdin (${EL}s with a stdin that never closes)" || bad "S7: L2 no perl (${EL}s '$OUT')"
+T0=$SECONDS; OUT="$(env PATH="$T/noperl" /bin/bash "$PE" < <(sleep 20) 2>&1)"; EL=$((SECONDS - T0)); lconf 'exit 1'
+[[ "$OUT" == *"perl missing"* ]] && (( EL <= 4 )) && ok "S7: L1 without perl warns before reading stdin" || bad "S7: L1 no perl (${EL}s '$OUT')"
+# 8. link text: trailing newline counts
+sconf "$GOODCHK"; setmain BAD; ln -s a "$SR/lk"; TA="$(agent q8)"; tr_edit "$TA" "$SR/src/main.txt"; pre q8 SubagentHandback; lrc "S8: untracked link, first state -> block" 2
+/bin/rm -f "$SR/lk"; ln -s "a
+" "$SR/lk"; pre q8 SubagentHandback; lrc "S8: same link, target differs only by a trailing newline -> new state, blocked again" 2; /bin/rm -f "$SR/lk"
+# 9. a newline in any path component
+mkdir -p "$SR/dd" "$SR/dd
+"; echo n > "$SR/dd/a.txt"; echo n > "$SR/dd
+/a.txt"
+sconf 'true' 'cat "$VERIFY_CHANGED_FILE" > "$LISTLOG"; exit 1'; TA="$(agent q9)"; tr_edit "$TA" "$SR/src/main.txt"; tr_edit "$TA" "$SR/dd
+/a.txt"; pre q9 SubagentHandback
+[[ "$(tr '\n' ' ' < "$LISTLOG")" == "src/main.txt " ]] && ok "S9: a path with a newline in a folder name is not listed (and does not alias the folder without it)" || bad "S9: list was: $(tr '\n' '|' < "$LISTLOG")"
+/bin/rm -rf "$SR/dd" "$SR/dd
+"
+# 10. colon form of SGR colour
+lconf 'printf "\033[38:2::255:0:0m%s\033[0m: error\n" "$EDIT_FILE"; exit 1'; lpost "$LR/src/a.ts"; lrc "S10: ANSI SGR with colons (true colour) around the path -> block" 2
 
 echo; echo "$pass passed, $fail failed"; (( fail == 0 ))

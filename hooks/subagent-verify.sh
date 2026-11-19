@@ -17,7 +17,7 @@
 # If there is one, run that project's check at its root.
 #
 # Config, same projects file as stop-verify.sh ($STOP_VERIFY_CONFIG is used only when it is an
-# absolute path). Opt-in per project: a project without "handback_verify" is never checked here.
+# absolute path to a file under ~/.claude or ~/.config). Opt-in per project: a project without "handback_verify" is never checked here.
 #   handback_verify   bash command to run at the checkout root (no fallback to "verify")
 #   handback_limit    seconds before the run is stopped as "not verified" (1..440, default 420)
 #   requires          optional path that must exist under the root, as for stop-verify.sh
@@ -35,16 +35,18 @@
 #   session's edit. The block message says so.
 #
 # The whole hook, including reading stdin, runs under a 460 s budget (the plugin hook timeout is
-# 480); the inner process is started by us with --inner and a TERM is forwarded to the check. Test-only overrides SUBVERIFY_STATE and SUBVERIFY_TOTAL are ignored when this script
-# lives under ~/.claude. They never touch trust: trust is only "roots".
+# 480); the inner process is started by us with --inner and a TERM is forwarded to the check.
+# Test-only overrides SUBVERIFY_STATE and SUBVERIFY_TOTAL are ignored when this script lives under
+# ~/.claude. They never touch trust: trust is only "roots".
 # Ledger: ~/.claude/state/subagent-verify/ledger.tsv  (time, project, agent, result, seconds)
 #   result: pass | fail | timeout | error | repeat | capped | no-change | no-transcript | skip
 set -uo pipefail
+START=$SECONDS
 SELF="${BASH_SOURCE[0]}"
 SELF_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd -P)"
-START=$SECONDS
-CONF="$HOME/.claude/stop-verify.projects.json"
-[[ "${STOP_VERIFY_CONFIG:-}" == /* ]] && CONF="$STOP_VERIFY_CONFIG"   # a relative path is ignored
+# shellcheck source=lib/projects.sh
+source "$SELF_DIR/lib/projects.sh" 2>/dev/null || exit 0
+CONF="$(pick_conf)"
 [[ -f "$CONF" ]] || exit 0
 STATE_DIR="$HOME/.claude/state/subagent-verify"
 TOTAL_LIMIT=460
@@ -55,10 +57,8 @@ if [[ -z "$CLAUDE_HOME" || "$SELF_DIR" != "$CLAUDE_HOME"/* ]]; then
   [[ "${SUBVERIFY_TOTAL:-}" =~ ^[0-9]{1,3}$ ]] && TOTAL_LIMIT=$((10#$SUBVERIFY_TOTAL)) && (( TOTAL_LIMIT >= 1 )) || TOTAL_LIMIT=460
 fi
 INNER=0; for a in "$@"; do [[ "$a" == --inner ]] && INNER=1; done
-# shellcheck source=lib/projects.sh
-source "$SELF_DIR/lib/projects.sh" 2>/dev/null || exit 0
 
-msg() { jq -cn --arg m "[subagent-verify] $1" '{systemMessage:$m}' 2>/dev/null; }
+msg() { run_limited 2 jq -cn --arg m "[subagent-verify] $1" '{systemMessage:$m}' 2>/dev/null; }
 led() {  # project, result   (needs AGENT, START)
   ledger_append "$STATE_DIR" "$1" "${AGENT:0:8}" "$2" "$((SECONDS - START))"
 }
@@ -67,13 +67,12 @@ WARN='{"systemMessage":"[subagent-verify] %s; subagent check skipped"}\n'
 # ---------- outer: watchdog around the whole decision ----------
 if (( INNER == 0 )); then
   trap 'exit 143' TERM INT
-  # Reading stdin is bounded too (without perl it cannot be, and is read plainly).
-  RC=0
-  if command -v perl >/dev/null 2>&1; then INPUT="$(run_limited 5 cat)"; RC=$?; else INPUT="$(cat)"; fi
+  # Without perl nothing can be bounded: warn and leave before touching stdin.
+  command -v perl >/dev/null 2>&1 || { printf "$WARN" "perl missing"; exit 0; }
+  RC=0; INPUT="$(run_limited 5 cat)"; RC=$?   # reading stdin is bounded too
   # Cheap exit for every other tool call: nothing else is started.
   case "$INPUT" in *SubagentHandback*|*SubagentStop*) ;; *) exit 0 ;; esac
   command -v jq >/dev/null 2>&1 || { printf "$WARN" "jq missing"; exit 0; }
-  command -v perl >/dev/null 2>&1 || { printf "$WARN" "perl missing"; exit 0; }
   (( RC == 0 )) || { printf "$WARN" "stdin was not complete in 5 s"; exit 0; }
   OUTF="$(mktemp "${TMPDIR:-/tmp}/sv-out.XXXXXX")" || exit 0
   ERRF="$(mktemp "${TMPDIR:-/tmp}/sv-err.XXXXXX")" || { /bin/rm -f "$OUTF"; exit 0; }
@@ -81,7 +80,7 @@ if (( INNER == 0 )); then
   LEFT=$((TOTAL_LIMIT - (SECONDS - START))); (( LEFT >= 1 )) || LEFT=1
   printf '%s' "$INPUT" | run_limited "$LEFT" bash "$SELF" --inner >"$OUTF" 2>"$ERRF"; RC=$?
   if (( RC == 124 || (RC != 0 && RC != 2) )); then
-    AGENT="$(printf '%s' "$INPUT" | jq -r '.agent_id // "noagent"' 2>/dev/null)"; AGENT="${AGENT//[^A-Za-z0-9_-]/_}"
+    AGENT="$(printf '%s' "$INPUT" | run_limited 2 jq -r '.agent_id // "noagent"' 2>/dev/null)"; AGENT="${AGENT//[^A-Za-z0-9_-]/_}"
     if (( RC == 124 )); then led_bounded "$STATE_DIR" "-" "${AGENT:0:8}" timeout "$((SECONDS - START))"; msg "Subagent check timed out (${TOTAL_LIMIT} s); not verified."
     else led_bounded "$STATE_DIR" "-" "${AGENT:0:8}" error "$((SECONDS - START))"; msg "Subagent check failed by itself (rc=${RC}); not verified."; fi
     exit 0
@@ -92,9 +91,9 @@ fi
 
 # ---------- inner ----------
 START=$SECONDS
-LOG=""; LIST=""; NOSTART=""; XF1=""; XF2=""; FPD=""; FPU=""; FPF=""; LOCKHELD=0; LOCKD=""
+LOG=""; LIST=""; STARTED=""; XF1=""; XF2=""; FPD=""; FPU=""; FPF=""; LOCKHELD=0; LOCKD=""
 cleanup() {
-  /bin/rm -f "$LOG" "$LIST" "$NOSTART" "$XF1" "$XF2" "$FPD" "$FPU" "$FPF" 2>/dev/null
+  /bin/rm -f "$LOG" "$LIST" "$STARTED" "$XF1" "$XF2" "$FPD" "$FPU" "$FPF" 2>/dev/null
   (( LOCKHELD )) && [[ -n "$LOCKD" ]] && rmdir "$LOCKD" 2>/dev/null
   return 0
 }
@@ -123,7 +122,8 @@ fi
 AGENT="${AGENT//[^A-Za-z0-9_-]/_}"
 
 (umask 077; mkdir -p "$STATE_DIR") 2>/dev/null || { msg "Cannot create the state folder; not verified."; exit 0; }
-find "$STATE_DIR" -name '*.blocked' -mtime +7 -delete 2>/dev/null
+# prune only this hook's own block records (<session>.<agent>.blocked, this folder only), after 30 days
+find "$STATE_DIR" -maxdepth 1 -type f -name '[A-Za-z0-9_-]*.[A-Za-z0-9_-]*.blocked' -mtime +30 -delete 2>/dev/null
 [[ -n "$HASH" ]] || { led "-" error; msg "shasum/sha1sum missing; not verified."; exit 0; }
 # No fallback to the main session transcript: it would blame the subagent for the parent's edits.
 if [[ -z "$T" || ! -f "$T" ]]; then
@@ -139,6 +139,9 @@ fi
 OK_JQ='
   [inputs] as $all
   | (reduce ($all[] | select(.type == "user") | .message.content? | arrays | .[]
+        | select(type == "object" and .type == "tool_result")
+        | .tool_use_id) as $id ({}; .[$id] = true)) as $seen
+  | (reduce ($all[] | select(.type == "user") | .message.content? | arrays | .[]
         | select(type == "object" and .type == "tool_result" and ((.is_error // false) | not))
         | .tool_use_id) as $id ({}; .[$id] = true)) as $ok'
 FILES_JQ="$OK_JQ"'
@@ -150,10 +153,11 @@ FILES_JQ="$OK_JQ"'
       | select(type == "string" and startswith("/")) ]
   | unique | .[] | . + "\u0000"'
 # Bash calls with a write sign: prints cwd NUL command NUL. A call whose result was an error still
-# counts: a command can write and then fail.
+# counts (a command can write and then fail); a call with no result at all does not (it may never
+# have run).
 BASH_JQ="$OK_JQ"'
   | $all[] | select(.type == "assistant") | (.cwd // "") as $cwd | .message.content? | arrays | .[]
-    | select(type == "object" and .type == "tool_use" and .name == "Bash")
+    | select(type == "object" and .type == "tool_use" and .name == "Bash" and ($seen[.id // ""] == true))
     | (.input.command // "" | tostring) as $c
     | ($c | gsub("[0-9]?>&[0-9]"; "") | gsub("[0-9]?>>? ?/dev/null"; "")) as $x
     | select($x | test(">|>>|sed +(-[A-Za-z]+ +)*-i|git apply|(^|[;&|(] *)(mv|cp|rm|tee|patch|install) |git +(-[Cc] +.*[ \"])?(checkout|switch|reset|restore|apply|am|merge|rebase|cherry-pick|commit|rm|mv|clean|stash( +(push|pop|apply|drop|save|clear|branch|create|store)|( +-[-A-Za-z]+)*( *$| *[;&|])))|\\.write_text|\\.write_bytes|writeFileSync"))
@@ -172,6 +176,7 @@ add_root() { local u; for u in ${UROOTS[@]+"${UROOTS[@]}"}; do [[ "$u" == "$1" ]
 # 1a. structured edits
 GONE=0; CD_LAST=""; CR_LAST=""; CK_LAST=""
 for f in ${PLIST[@]+"${PLIST[@]}"}; do
+  [[ "$f" == *$'\n'* ]] && continue   # a newline anywhere in the path: never trusted, never listed
   if [[ ! -f "$f" ]]; then GONE=$((GONE + 1)); continue; fi
   if [[ -L "$f" ]]; then continue; fi
   d="$(cd "$(dirname "$f")" 2>/dev/null && pwd -P)" || { GONE=$((GONE + 1)); continue; }
@@ -252,11 +257,9 @@ bf_count() {  # prints the number of blocks recorded; fails if the record exists
   [[ "$n" =~ ^[0-9]+$ ]] || return 1
   printf '%s' "$n"
 }
-fingerprint() {  # root -> prints a hash; fails (prints nothing) if any step cannot be listed or hashed
+fingerprint() {  # root -> sets FPRES to a hash; fails (FPRES empty) if any step cannot be listed or hashed
   local r="$1" rc
-  FPD="$(mktemp "${TMPDIR:-/tmp}/sv-fd.XXXXXX")" || return 1
-  FPU="$(mktemp "${TMPDIR:-/tmp}/sv-fu.XXXXXX")" || { /bin/rm -f "$FPD"; return 1; }
-  FPF="$(mktemp "${TMPDIR:-/tmp}/sv-ff.XXXXXX")" || { /bin/rm -f "$FPD" "$FPU"; return 1; }
+  FPRES=""; : > "$FPD"; : > "$FPU"; : > "$FPF"
   (
     printf '%s\0' "$r"
     git -C "$r" rev-parse -q --verify HEAD || exit 1                       # no commit yet -> not verified
@@ -265,16 +268,20 @@ fingerprint() {  # root -> prints a hash; fails (prints nothing) if any step can
     git -C "$r" -c core.fsmonitor=false ls-files -z --others --exclude-standard >"$FPU" 2>/dev/null || exit 1
     while IFS= read -r -d '' f; do
       printf '%s\0' "$f"
-      if [[ -L "$r/$f" ]]; then printf 'link %s\n' "$(readlink "$r/$f")"          # never follow a link
+      if [[ -L "$r/$f" ]]; then
+        printf 'link '                                                     # never follow a link: its exact text, bytes as they are
+        perl -e 'my $l = readlink($ARGV[0]); defined $l or exit 1; print $l' "$r/$f" || exit 1
+        printf '\0'
       elif [[ -f "$r/$f" ]]; then "$HASH" < "$r/$f" || exit 1
-      else echo other; fi                                                          # fifo, socket, device
+      else echo other; fi                                                  # fifo, socket, device
     done < "$FPU"
   ) >"$FPF" 2>/dev/null; rc=$?
-  if (( rc == 0 )); then "$HASH" < "$FPF" | cut -c1-40; fi
-  /bin/rm -f "$FPD" "$FPU" "$FPF"
+  if (( rc == 0 )); then FPRES="$("$HASH" < "$FPF" | cut -c1-40)"; fi
   return $rc
 }
 
+# temp files for the fingerprint live in this shell, so the EXIT/TERM cleanup knows them
+FPD="$(mktemp "${TMPDIR:-/tmp}/sv-fd.XXXXXX")" && FPU="$(mktemp "${TMPDIR:-/tmp}/sv-fu.XXXXXX")" && FPF="$(mktemp "${TMPDIR:-/tmp}/sv-ff.XXXXXX")" || { led "-" error; msg "Cannot create a temp file; not verified."; exit 0; }
 FAIL_TEXT=""; RC=0; PASS_TEXT=""; k=0
 for ROOT in "${UROOTS[@]}"; do
   KEY="${UKEYS[$k]}"; k=$((k + 1))
@@ -293,7 +300,7 @@ for ROOT in "${UROOTS[@]}"; do
   fi
   if [[ -n "$REQ" && ! -e "$ROOT/$REQ" ]]; then led "$KEY" skip; NOTES+="$NAME: $REQ is missing; not verified. "; continue; fi
 
-  FP="$(fingerprint "$ROOT")"
+  fingerprint "$ROOT"; FP="$FPRES"
   if [[ ${#FP} != 40 ]]; then led "$KEY" error; NOTES+="$NAME: could not list or hash the changes (a repo with no commit, or an unreadable file); not verified. "; continue; fi
   if grep -qxF "$FP" "$BF" 2>/dev/null; then
     led "$KEY" repeat; NOTES+="$NAME: this exact state was already blocked once and is not re-run; not verified. "; continue
@@ -305,7 +312,7 @@ for ROOT in "${UROOTS[@]}"; do
 
   LOG="$(mktemp "${TMPDIR:-/tmp}/subagent-verify.XXXXXX")" || { LOG=""; led "$KEY" error; NOTES+="Cannot create a temp file; not verified. "; continue; }
   LIST="$(mktemp "${TMPDIR:-/tmp}/subagent-verify-list.XXXXXX")" || { LIST=""; led "$KEY" error; NOTES+="Cannot create a temp file; not verified. "; continue; }
-  NOSTART="$LIST.nostart"
+  STARTED="$LIST.started"
   # the list holds only files that passed validation, for this checkout
   i=0
   while (( i < ${#EF[@]} )); do
@@ -317,13 +324,16 @@ for ROOT in "${UROOTS[@]}"; do
   if (( LEFT < 3 )); then led "$KEY" timeout; NOTES+="$NAME: out of time; not verified. "; /bin/rm -f "$LOG" "$LIST"; LOG=""; LIST=""; continue; fi
   (( LIMIT < LEFT )) && LEFT=$LIMIT
   T0=$SECONDS
-  ( cd "$ROOT" 2>/dev/null && [[ "$(pwd -P)" == "$ROOT" ]] || { : > "$NOSTART"; exit 1; }
-    VERIFY_CHANGED_FILE="$LIST" run_limited "$LEFT" bash -c "$VERIFY" ) </dev/null >"$LOG" 2>&1
+  # STARTED is created inside the subshell, after cd and after the redirections to $LOG worked. If
+  # either failed, the verifier never ran and its status says nothing about the project.
+  { ( cd "$ROOT" 2>/dev/null && [[ "$(pwd -P)" == "$ROOT" ]] || exit 1
+      : > "$STARTED" || exit 1
+      VERIFY_CHANGED_FILE="$LIST" run_limited "$LEFT" bash -c "$VERIFY" ) </dev/null >"$LOG" 2>&1; } 2>/dev/null
   TRC=$?
   EL=$((SECONDS - T0))
-  if [[ -e "$NOSTART" ]]; then
-    led "$KEY" error; NOTES+="$NAME: could not enter the checkout; the check did not start; not verified. "
-    /bin/rm -f "$LOG" "$LIST" "$NOSTART"; LOG=""; LIST=""; continue
+  if [[ ! -e "$STARTED" ]]; then
+    led "$KEY" error; NOTES+="$NAME: the check did not start (cannot enter the checkout or open the log); not verified. "
+    /bin/rm -f "$LOG" "$LIST" "$STARTED"; LOG=""; LIST=""; continue
   fi
   if (( TRC == 0 )); then VERDICT=pass
   elif (( TRC == 124 )); then VERDICT=timeout
@@ -357,7 +367,7 @@ for ROOT in "${UROOTS[@]}"; do
         *) led "$KEY" error; NOTES+="$NAME: the check failed, but the block record could not be written or locked; not blocking, to avoid a stuck agent; not verified. " ;;
       esac ;;
   esac
-  /bin/rm -f "$LOG" "$LIST" "$NOSTART"; LOG=""; LIST=""
+  /bin/rm -f "$LOG" "$LIST" "$STARTED"; LOG=""; LIST=""
 done
 
 if (( RC == 2 )); then
