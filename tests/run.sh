@@ -417,4 +417,237 @@ grep -q FAIL "$T/out" && ok "evidence: says FAIL" || bad "evidence: FAIL label"
 printf 'not json' > "$HOME/.claude/stop-verify.projects.json"
 expect_rc 0 "hook: broken config never traps the session" run_hook
 
+# ---------- post-edit-check.sh (layer 1) and subagent-verify.sh (layer 2) ----------
+PE="$ROOT/hooks/post-edit-check.sh"; SV="$ROOT/hooks/subagent-verify.sh"
+SC="$HOME/.claude/stop-verify.projects.json"
+lrc() { [[ "$RC" == "$2" ]] && ok "$1" || bad "$1 (rc=$RC, want $2)"; }
+has()  { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1 (missing '$3' in: ${2:0:200})" ;; esac; }
+hasnt() { case "$2" in *"$3"*) bad "$1 (unexpected '$3')" ;; *) ok "$1" ;; esac; }
+lastled() { tail -1 "$1" | cut -f"$2"; }
+lcommit() { git -C "$1" add -A && git -C "$1" -c user.email=t@t -c user.name=t commit -qm "${2:-c}"; }
+mkrepo() { mkdir -p "$1/src"; git -C "$1" init -q; git -C "$1" remote add origin "https://example.com/$2.git"; echo "$3" > "$1/src/a.ts"; echo "$3" > "$1/src/b.ts"; echo r > "$1/README.md"; lcommit "$1" init; }
+
+# --- layer 1 ---
+LR="$T/l1/lapp"; LU="$T/l1u/lapp"; LWT="$T/l1/lapp-wt"; mkdir -p "$T/l1" "$T/l1u"
+mkrepo "$LR" acme/lapp x; mkrepo "$LU" acme/lapp x
+git -C "$LR" worktree add -q "$LWT" -b wtb 2>/dev/null
+LRP="$(cd "$LR" && pwd -P)"; LUP="$(cd "$LU" && pwd -P)"; LWTP="$(cd "$LWT" && pwd -P)"
+LL="$HOME/.claude/state/post-edit-check/ledger.tsv"; export LMARK="$T/mark"
+lconf() {  # cmd [files_re] [limit] [roots-json]
+  jq -n --arg cmd "$1" --arg re "${2:-^src/.*\\.ts\$}" --argjson lim "${3:-5}" --argjson roots "${4:-[\"$LRP\"]}" \
+    '{"acme/lapp":{roots:$roots,code_re:"^src/",verify:"true",edit_check:{files_re:$re,cmd:$cmd,limit:$lim}}}' > "$SC"
+  rm -rf "$HOME/.claude/state/post-edit-check" "$LMARK"
+}
+PENV=(); SENV=()
+lpost() {  # file [tool]
+  jq -nc --arg f "$1" --arg t "${2:-Edit}" '{tool_name:$t,tool_input:{file_path:$f}}' | env ${PENV[@]+"${PENV[@]}"} bash "$PE" >"$T/lout" 2>"$T/lerr"; RC=$?; OUT="$(cat "$T/lout")"; ERR="$(cat "$T/lerr")"
+}
+bash -n "$PE" && bash -n "$SV" && ok "layers 1+2: bash -n" || bad "layers 1+2: bash -n"
+lconf 'echo "$EDIT_FILE(1,1): error TS2322: bad"; exit 2'
+lpost "$LR/src/a.ts"; lrc "L1: error line names the edited file -> block" 2
+has "L1: stderr names the file" "$ERR" "src/a.ts(1,1): error"; has "L1: stderr is English and short" "$ERR" "already saved"
+[[ "$(lastled "$LL" 4)" == block ]] && ok "L1: ledger block" || bad "L1: ledger block"
+lconf 'echo "src/other.ts(1,1): error TS2322: bad"; exit 2'
+lpost "$LR/src/a.ts"; lrc "L1: errors only in other files -> pass" 0
+[[ "$(lastled "$LL" 4)" == pass ]] && ok "L1: ledger pass" || bad "L1: ledger pass"
+lconf 'echo "$PWD/$EDIT_FILE:3: error"; exit 1'; lpost "$LR/src/a.ts"; lrc "L1: absolute path of the file counts" 2
+lconf 'echo "./$EDIT_FILE: error"; exit 1'; lpost "$LR/src/a.ts"; lrc "L1: ./relative path counts" 2
+lconf 'echo "lib/$EDIT_FILE(1,1): error"; exit 1'; lpost "$LR/src/a.ts"; lrc "L1: same tail under another folder is not this file" 0
+lconf 'echo "${EDIT_FILE}x(1,1): error"; exit 1'; lpost "$LR/src/a.ts"; lrc "L1: src/a.tsx is not src/a.ts (whole path components)" 0
+lconf 'echo "${EDIT_FILE}.map: error"; exit 1'; lpost "$LR/src/a.ts"; lrc "L1: src/a.ts.map is not src/a.ts" 0
+lconf 'echo "$EDIT_FILE: error"; exit 0'; lpost "$LR/src/a.ts"; lrc "L1: exit 0 never blocks, even with output naming the file" 0
+lconf 'echo "boom without any file"; exit 1'; lpost "$LR/src/a.ts"; lrc "L1: non-zero exit but no line names the file -> pass" 0
+lconf 'for i in $(seq 1 40); do echo "$EDIT_FILE($i,1): error $i"; done; exit 1'; lpost "$LR/src/a.ts"
+lrc "L1: 40 diagnostics -> block" 2; [[ "$(wc -l < "$T/lerr" | tr -d ' ')" -le 22 ]] && has "L1: at most 20 diagnostic lines, rest counted" "$ERR" "20 more lines not shown" || bad "L1: line cap"
+lconf 'touch "$LMARK"; exit 0'; lpost "$LR/README.md"; lrc "L1: file not matching files_re -> 0" 0
+[[ ! -e "$LMARK" ]] && ok "L1: ... and the check did not run" || bad "L1: ran for a non-matching file"
+lconf 'touch "$LMARK"; exit 1'; lpost "$LR/src/a.ts" Bash; lrc "L1: other tool name -> 0" 0
+lconf 'touch "$LMARK"; echo "$EDIT_FILE: x"; exit 1'; lpost "$LR/src/a.ts" MultiEdit; lrc "L1: MultiEdit is handled" 2
+lconf 'sleep 20' '^src/' 2; T0=$SECONDS; lpost "$LR/src/a.ts"; EL=$((SECONDS - T0))
+lrc "L1: check hangs -> fail open (exit 0)" 0; [[ "$(lastled "$LL" 4)" == timeout ]] && ok "L1: ledger timeout" || bad "L1: ledger timeout"
+has "L1: timeout is announced as not verified" "$OUT" "not verified"; (( EL <= 6 )) && ok "L1: timeout returned in ${EL}s" || bad "L1: timeout slow (${EL}s)"
+lconf 'no-such-tool-xyz --check'; lpost "$LR/src/a.ts"; lrc "L1: missing tool (127) -> 0" 0
+[[ "$(lastled "$LL" 4)" == error ]] && ok "L1: ledger error" || bad "L1: ledger error for 127"
+lconf 'kill -9 $$'; lpost "$LR/src/a.ts"; lrc "L1: check killed by a signal -> 0" 0; [[ "$(lastled "$LL" 4)" == error ]] && ok "L1: ledger error for a signal" || bad "L1: ledger signal"
+lconf 'rm -f src/a.ts; echo "$EDIT_FILE: x"; exit 1'; lpost "$LR/src/a.ts"; lrc "L1: file vanishes during the check -> 0" 0; git -C "$LR" checkout -q -- src/a.ts
+jq -n --arg r "$LRP" '{"acme/lapp":{roots:[$r],edit_check:{files_re:"^src/",cmd:"exit 1",limit:"x"}}}' > "$SC"; lpost "$LR/src/a.ts"; lrc "L1: bad edit_check type -> 0" 0; has "L1: ... says so" "$OUT" "edit_check"
+jq -n --arg r "$LRP" '{"acme/lapp":{roots:[$r],verify:"true"}}' > "$SC"; lpost "$LR/src/a.ts"; lrc "L1: project without edit_check -> does nothing" 0
+echo '{}' > "$SC"; lpost "$LR/src/a.ts"; lrc "L1: repo not in the config -> 0" 0
+lconf 'touch "$LMARK"; echo "$EDIT_FILE: x"; exit 1' '^src/' 5 "[\"$T/elsewhere\"]"; lpost "$LR/src/a.ts"
+lrc "L1: checkout not in roots -> ignored" 0; [[ ! -e "$LMARK" ]] && ok "L1: ... check did not run" || bad "L1: untrusted checkout ran"
+[[ "$(lastled "$LL" 4)" == skip ]] && ok "L1: ... ledger skip" || bad "L1: ledger skip"
+lconf 'touch "$LMARK"; echo "$EDIT_FILE: x"; exit 1'; lpost "$LU/src/a.ts"; lrc "L1: another clone of the same owner/repo -> ignored" 0
+[[ ! -e "$LMARK" ]] && ok "L1: ... check did not run" || bad "L1: other clone ran"
+ln -s "$LUP/src/b.ts" "$LR/src/link.ts"; lpost "$LR/src/link.ts"; lrc "L1: symlinked file -> ignored" 0
+[[ ! -e "$LMARK" ]] && ok "L1: ... check did not run" || bad "L1: symlinked file ran"; rm "$LR/src/link.ts"
+ln -s "$LUP" "$LR/linkdir"; lpost "$LR/linkdir/src/a.ts"; lrc "L1: file reached through a symlinked folder out of roots -> ignored" 0
+[[ ! -e "$LMARK" ]] && ok "L1: ... check did not run" || bad "L1: symlinked folder ran"; rm "$LR/linkdir"
+lpost "$LWT/src/a.ts"; lrc "L1: linked worktree of a trusted checkout is trusted" 2
+mkdir -p "$LR/src/sub dir"; echo y > "$LR/src/sub dir/c.ts"
+lconf 'echo "$EDIT_FILE(1,1): x"; exit 1'; lpost "$LR/src/sub dir/c.ts"; lrc "L1: path with a space and a folder -> block" 2; has "L1: ... shows repo-relative path" "$ERR" "src/sub dir/c.ts(1,1)"
+echo not-json > "$T/in"; RC=0; bash "$PE" < "$T/in" >/dev/null 2>&1 || RC=$?; lrc "L1: garbage stdin -> 0" 0
+rm -f "$SC"; RC=0; echo '{"tool_name":"Edit","tool_input":{"file_path":"/x"}}' | bash "$PE" >/dev/null 2>&1 || RC=$?; lrc "L1: no config file at all -> 0" 0
+# watchdog around the whole decision: a git that hangs is cut off
+lconf 'exit 1'; mkdir -p "$T/gitshim"; printf '#!/bin/bash\nsleep 30\n' > "$T/gitshim/git"; chmod +x "$T/gitshim/git"
+T0=$SECONDS; PENV=("PATH=$T/gitshim:$PATH" POST_EDIT_LIMIT=4); lpost "$LR/src/a.ts"; PENV=(); EL=$((SECONDS - T0))
+lrc "L1: hang while locating the repo -> 0 (outer watchdog)" 0; [[ "$(lastled "$LL" 4)" == timeout ]] && ok "L1: ... ledger timeout" || bad "L1: watchdog ledger"; (( EL <= 8 )) && ok "L1: ... returned in ${EL}s" || bad "L1: watchdog slow (${EL}s)"
+rm -f "$T/gitshim/git"
+# overrides are test-only: an installed copy ignores them
+lconf 'echo "$EDIT_FILE: x"; exit 1'; mkdir -p "$HOME/.claude/hooks/lib"; cp "$PE" "$HOME/.claude/hooks/"; cp "$ROOT/hooks/lib/projects.sh" "$HOME/.claude/hooks/lib/"
+rm -rf "$T/ovr"; jq -nc --arg f "$LR/src/a.ts" '{tool_name:"Edit",tool_input:{file_path:$f}}' | POST_EDIT_STATE="$T/ovr" bash "$PE" >/dev/null 2>&1
+[[ -s "$T/ovr/ledger.tsv" ]] && ok "L1 control: the repo copy honours POST_EDIT_STATE" || bad "L1 control: override not honoured"
+rm -rf "$T/ovr" "$HOME/.claude/state/post-edit-check"; jq -nc --arg f "$LR/src/a.ts" '{tool_name:"Edit",tool_input:{file_path:$f}}' | POST_EDIT_STATE="$T/ovr" bash "$HOME/.claude/hooks/post-edit-check.sh" >/dev/null 2>&1; RC=$?
+lrc "L1: installed copy still works" 2; [[ ! -e "$T/ovr" && -s "$LL" ]] && ok "L1: installed copy ignores POST_EDIT_STATE" || bad "L1: installed copy honoured the override"
+printf '#!/bin/bash\nsleep 8\n' > "$T/gitshim/git"; chmod +x "$T/gitshim/git"; T0=$SECONDS
+jq -nc --arg f "$LR/src/a.ts" '{tool_name:"Edit",tool_input:{file_path:$f}}' | PATH="$T/gitshim:$PATH" POST_EDIT_LIMIT=2 bash "$HOME/.claude/hooks/post-edit-check.sh" >/dev/null 2>&1; EL=$((SECONDS - T0))
+(( EL >= 7 )) && ok "L1: installed copy ignores POST_EDIT_LIMIT (watchdog not cut to 2 s)" || bad "L1: installed copy honoured POST_EDIT_LIMIT (${EL}s)"
+rm -f "$T/gitshim/git" "$HOME/.claude/hooks/post-edit-check.sh"
+
+# --- layer 2 ---
+SR="$T/l2/sv app"; SO="$T/l2/svapp-other"; SU="$T/l2u/sv app"; SP2="$T/l2/app-p2"; SP2B="$T/l2/app-p2b"; mkdir -p "$T/l2" "$T/l2u"
+mkrepo "$SR" acme/svapp OK; mkrepo "$SU" acme/svapp OK; mkrepo "$SP2" acme/p2 BAD; mkrepo "$SP2B" acme/p2b OK
+for r in "$SR" "$SP2" "$SP2B"; do echo OK > "$r/src/main.txt"; done; echo BAD > "$SP2/src/main.txt"; for r in "$SR" "$SP2" "$SP2B"; do lcommit "$r" m; done
+SRP="$(cd "$SR" && pwd -P)"; SUP="$(cd "$SU" && pwd -P)"; SP2P="$(cd "$SP2" && pwd -P)"; SP2BP="$(cd "$SP2B" && pwd -P)"
+SL="$HOME/.claude/state/subagent-verify/ledger.tsv"; RAN="$T/ran"; LISTLOG="$T/listlog"
+GOODCHK='echo x >> "$RAN"; cat "$VERIFY_CHANGED_FILE" >> "$LISTLOG"; grep -q OK src/main.txt || { echo "FAILED: main.txt lacks OK"; exit 1; }'
+export RAN LISTLOG
+sconf() {  # verify [handback_verify] [handback_limit]
+  jq -n --arg v "$1" --arg hv "${2:-}" --argjson hl "${3:-null}" --arg a "$SRP" --arg b "$SP2P" --arg c "$SP2BP" \
+    '{"acme/svapp":({roots:[$a],code_re:"^src/",verify:$v} + (if $hv != "" then {handback_verify:$hv} else {} end) + (if $hl != null then {handback_limit:$hl} else {} end)),
+      "acme/p2":{roots:[$b],verify:"grep -q OK src/main.txt"}, "acme/p2b":{roots:[$c],verify:"grep -q OK src/main.txt"}}' > "$SC"
+  rm -rf "$HOME/.claude/state/subagent-verify" "$RAN" "$LISTLOG"
+}
+setmain() { echo "$1" > "$SR/src/main.txt"; }
+runs() { [[ -f "$RAN" ]] && wc -l < "$RAN" | tr -d ' ' || echo 0; }
+PRJ="$T/l2/proj"; MAINP="$PRJ/sPre.jsonl"; mkdir -p "$PRJ/sPre/subagents"
+tr_init() { : > "$1"; echo '{"type":"user","message":{"role":"user","content":"task"}}' >> "$1"; }
+tr_tool() {  # file name input-json is_error [cwd]
+  local id="tu$RANDOM$RANDOM"
+  jq -nc --arg id "$id" --arg n "$2" --argjson i "$3" --arg cwd "${5:-}" '{type:"assistant",message:{role:"assistant",content:[{type:"tool_use",id:$id,name:$n,input:$i}]}} | if $cwd != "" then .cwd = $cwd else . end' >> "$1"
+  jq -nc --arg id "$id" --argjson e "${4:-false}" '{type:"user",message:{role:"user",content:[{type:"tool_result",tool_use_id:$id,is_error:$e,content:"ok"}]}}' >> "$1"
+}
+tr_edit() { tr_tool "$1" "${4:-Edit}" "$(jq -nc --arg f "$2" '{file_path:$f,old_string:"a",new_string:"b"}')" "${3:-false}"; }
+tr_bash() { tr_tool "$1" Bash "$(jq -nc --arg c "$2" '{command:$c}')" false "${3:-}"; }
+aid() { basename "$1" .jsonl | sed 's/^agent-//'; }
+agent() { local p="$PRJ/sPre/subagents/agent-$1.jsonl"; tr_init "$p"; printf '%s' "$p"; }   # new transcript for agent id
+prein() {  # agent_id tool_name [session_id]  (the real input has no tool_input; transcript_path = main session)
+  jq -nc --arg a "$1" --arg tn "$2" --arg s "${3:-sPre}" --arg c "$SRP" --arg m "$MAINP" '{session_id:$s,transcript_path:$m,cwd:$c,agent_id:$a,agent_type:"worker",hook_event_name:"PreToolUse",tool_name:$tn,tool_use_id:"tu1"} | if $a == "" then del(.agent_id) else . end'
+}
+pre() {
+  prein "$@" | env ${SENV[@]+"${SENV[@]}"} bash "$SV" >"$T/sout" 2>"$T/serr"; RC=$?; OUT="$(cat "$T/sout")"; ERR="$(cat "$T/serr")"
+}
+sconf "$GOODCHK"; setmain BAD
+TA="$(agent a1)"; tr_tool "$TA" Read '{"file_path":"/etc/hosts"}'; tr_bash "$TA" 'git log --oneline | head -3 && echo commit'
+pre a1 SubagentHandback; lrc "L2: subagent changed nothing (tree is red from someone else) -> 0" 0
+[[ "$(lastled "$SL" 4)" == no-change && "$(runs)" == 0 ]] && ok "L2: ... ledger no-change, checks not run" || bad "L2: no-change ($(tail -1 "$SL"))"
+TA="$(agent a2)"; tr_edit "$TA" "$SR/src/main.txt"
+pre a2 SubagentHandback; lrc "L2: own edit, checks fail -> 2" 2
+has "L2: stderr has the output" "$ERR" "FAILED: main.txt lacks OK"; has "L2: stderr names the shared-checkout caveat" "$ERR" "may be shared"
+has "L2: stderr starts with the hand-in wording" "$ERR" "Before you hand in your report"
+[[ "$(lastled "$SL" 4)" == fail ]] && ok "L2: ledger fail" || bad "L2: ledger fail"
+pre a2 SubagentHandback; lrc "L2: same fingerprint again -> 0, not re-run" 0; [[ "$(lastled "$SL" 4)" == repeat && "$(runs)" == 1 ]] && ok "L2: ... ledger repeat, one run only" || bad "L2: repeat ($(runs) runs)"
+has "L2: ... says not verified" "$OUT" "not verified"
+setmain BAD2; pre a2 SubagentHandback; lrc "L2: changed state -> second block" 2
+setmain BAD3; pre a2 SubagentHandback; lrc "L2: third distinct failing state -> capped at 2 blocks -> 0" 0
+[[ "$(lastled "$SL" 4)" == capped ]] && ok "L2: ... ledger capped" || bad "L2: capped ledger"
+TA="$(agent a3)"; tr_edit "$TA" "$SR/src/main.txt"; echo x > "$SR/untracked.txt"; setmain BAD
+pre a3 SubagentHandback; lrc "L2: (new agent) failing -> 2" 2
+echo y > "$SR/untracked.txt"; pre a3 SubagentHandback; lrc "L2: same untracked path, new content -> new fingerprint, blocked again" 2
+rm -f "$SR/untracked.txt"
+TA="$(agent a4)"; tr_edit "$TA" "$SR/src/main.txt" true; pre a4 SubagentHandback; lrc "L2: Edit whose tool result was an error is ignored -> 0" 0
+[[ "$(lastled "$SL" 4)" == no-change ]] && ok "L2: ... no-change" || bad "L2: error result"
+setmain OK; TA="$(agent a5)"; tr_edit "$TA" "$SR/src/main.txt"; pre a5 SubagentHandback; lrc "L2: own edit, checks pass -> 0" 0
+has "L2: ... pass notice" "$OUT" "checks passed"; [[ "$(lastled "$SL" 4)" == pass ]] && ok "L2: ledger pass" || bad "L2: ledger pass"
+has "L2: VERIFY_CHANGED_FILE lists the edited file (repo-relative)" "$(cat "$LISTLOG")" "src/main.txt"
+sconf 'exit 9' "$GOODCHK"; TA="$(agent a6)"; tr_edit "$TA" "$SR/src/main.txt"; pre a6 SubagentHandback
+lrc "L2: handback_verify is used instead of verify" 0; [[ "$(lastled "$SL" 4)" == pass ]] && ok "L2: ... ledger pass" || bad "L2: handback_verify ($(tail -1 "$SL"))"
+for spec in "127:error" "126:error" "124:timeout" "kill -9 \$\$:error"; do
+  c="${spec%%:*}"; want="${spec##*:}"; case "$c" in *kill*) cmd="$c" ;; *) cmd="exit $c" ;; esac
+  sconf "$cmd"; TA="$(agent "x$RANDOM")"; tr_edit "$TA" "$SR/src/main.txt"; pre "$(aid "$TA")" SubagentHandback; lrc "L2: check '$cmd' is 'not verified' -> 0" 0
+  [[ "$(lastled "$SL" 4)" == "$want" ]] && ok "L2: ... ledger $want" || bad "L2: '$cmd' ledger ($(tail -1 "$SL"))"
+done
+sconf 'exit 3'; TA="$(agent a7)"; tr_edit "$TA" "$SR/src/main.txt"; pre a7 SubagentHandback; lrc "L2: any other non-zero exit is a failure -> 2" 2
+sconf 'sleep 20' '' 2; TA="$(agent a8)"; tr_edit "$TA" "$SR/src/main.txt"; T0=$SECONDS; pre a8 SubagentHandback; EL=$((SECONDS - T0))
+lrc "L2: handback_limit reached -> 0" 0; [[ "$(lastled "$SL" 4)" == timeout ]] && ok "L2: ... ledger timeout" || bad "L2: timeout ledger"; (( EL <= 8 )) && ok "L2: ... returned in ${EL}s" || bad "L2: timeout slow (${EL}s)"
+for bad_lim in 500 0 '"x"'; do
+  sconf "$GOODCHK" '' "$bad_lim"; TA="$(agent "l$RANDOM")"; tr_edit "$TA" "$SR/src/main.txt"; pre "$(aid "$TA")" SubagentHandback
+  [[ "$RC" == 0 && "$(runs)" == 0 ]] && ok "L2: handback_limit $bad_lim refused, checks not run, exit 0" || bad "L2: handback_limit $bad_lim (rc=$RC runs=$(runs))"
+done
+sconf ''; jq 'del(.["acme/svapp"].verify)' "$SC" > "$SC.n" && mv "$SC.n" "$SC"; TA="$(agent a9)"; tr_edit "$TA" "$SR/src/main.txt"; pre a9 SubagentHandback
+lrc "L2: no verify command at all -> 0" 0; has "L2: ... says so" "$OUT" "no handback_verify or verify"
+# Bash write detection
+sconf "$GOODCHK"; setmain BAD
+TA="$(agent b1)"; tr_bash "$TA" "printf x > \"$SRP/src/main.txt\"" /tmp; pre b1 SubagentHandback; lrc "L2: Bash '>' naming the checkout (cwd elsewhere) -> run -> 2" 2
+setmain OK; TA="$(agent b2)"; tr_bash "$TA" "sed -i.bak s/a/b/ main.txt" "$SR/src"; pre b2 SubagentHandback; lrc "L2: Bash sed -i with cwd inside the checkout -> run, pass -> 0" 0
+[[ "$(lastled "$SL" 4)" == pass ]] && ok "L2: ... ledger pass (really ran)" || bad "L2: sed -i ($(tail -1 "$SL"))"
+TA="$(agent b3)"; tr_bash "$TA" "cat \"$SRP/src/main.txt\" | head -3" /tmp; pre b3 SubagentHandback; [[ "$(lastled "$SL" 4)" == no-change ]] && ok "L2: read-only Bash naming the path -> no-change" || bad "L2: read-only bash"
+TA="$(agent b4)"; tr_bash "$TA" "echo hi > /tmp/other-file" /tmp; pre b4 SubagentHandback; [[ "$(lastled "$SL" 4)" == no-change ]] && ok "L2: Bash write to an unrelated path -> no-change" || bad "L2: unrelated write"
+TA="$(agent b5)"; tr_bash "$TA" "printf x > \"$SUP/src/main.txt\"" /tmp; pre b5 SubagentHandback; [[ "$(lastled "$SL" 4)" == no-change ]] && ok "L2: Bash write in an untrusted clone -> no-change" || bad "L2: untrusted bash"
+TA="$(agent b6)"; tr_bash "$TA" "python3 -c \"from pathlib import Path; Path('$SRP/src/x.txt').write_text('x')\"" /tmp; pre b6 SubagentHandback; [[ "$(lastled "$SL" 4)" == pass ]] && ok "L2: Bash .write_text on the checkout -> run" || bad "L2: write_text"
+setmain BAD
+for gc in 'git stash list' 'git stash show' 'git status' 'git log --oneline' 'git diff' 'git show HEAD' 'git -C . stash list'; do
+  TA="$(agent "ro$RANDOM")"; tr_bash "$TA" "$gc" "$SR"; pre "$(aid "$TA")" SubagentHandback
+  [[ "$(lastled "$SL" 4)" == no-change && $RC == 0 ]] && ok "L2: read-only '$gc' is not a write" || bad "L2: read-only '$gc' (rc=$RC $(tail -1 "$SL"))"
+done
+for gc in 'git stash push -m x' 'git stash' 'git checkout -- .' 'git clean -fd' 'git reset --hard'; do
+  TA="$(agent "wr$RANDOM")"; tr_bash "$TA" "$gc" "$SR"; pre "$(aid "$TA")" SubagentHandback
+  [[ "$(lastled "$SL" 4)" != no-change ]] && ok "L2: '$gc' counts as a write" || bad "L2: '$gc' ignored"
+done
+git -C "$SR" rm -q -- src/main.txt 2>/dev/null; TA="$(agent b7)"; tr_bash "$TA" "git rm -- src/main.txt" "$SR"; pre b7 SubagentHandback; lrc "L2: 'git rm' of a file the check reads -> run -> 2" 2
+git -C "$SR" reset -q HEAD -- src; git -C "$SR" checkout -q -- src/main.txt; setmain BAD
+rm -f "$SR/src/main.txt"; TA="$(agent b8)"; tr_bash "$TA" "rm \"$SRP/src/main.txt\"" /tmp; pre b8 SubagentHandback; lrc "L2: 'rm <abs path>' (file already gone) -> run -> 2" 2; git -C "$SR" checkout -q -- src/main.txt; setmain BAD
+# path components: app-p2 (fails) vs app-p2b (passes)
+TA="$(agent c1)"; tr_bash "$TA" "printf x >> \"$SP2BP/README.md\"" /tmp; pre c1 SubagentHandback; lrc "L2: write in app-p2b does not select app-p2 (red) -> 0" 0
+has "L2: ... app-p2b was checked" "$OUT" "app-p2b: checks passed"; hasnt "L2: ... app-p2 not named" "$OUT" "app-p2: "
+TA="$(agent c2)"; tr_bash "$TA" "printf x >> \"$SP2P/README.md\"" /tmp; pre c2 SubagentHandback; lrc "L2: write in app-p2 selects it -> 2" 2; has "L2: ... names [app-p2]" "$ERR" "[app-p2]"
+git -C "$SP2P" checkout -q -- README.md; git -C "$SP2BP" checkout -q -- README.md
+TA="$(agent c3)"; tr_bash "$TA" "mkdir -p \"$SP2BP/new/dir\" && printf x > \"$SP2BP/new/dir/f.txt\"" /tmp; pre c3 SubagentHandback; lrc "L2: write to a not-yet-existing path under app-p2b -> only app-p2b -> 0" 0; rm -rf "$SP2BP/new"
+# untrusted / symlink edits
+TA="$(agent d1)"; tr_edit "$TA" "$SUP/src/main.txt"; pre d1 SubagentHandback; [[ "$RC" == 0 && "$(lastled "$SL" 4)" == no-change ]] && ok "L2: edit in an untrusted clone -> no-change" || bad "L2: untrusted edit"
+ln -s "$SUP/src/main.txt" "$SR/src/lnk.txt"; TA="$(agent d2)"; tr_edit "$TA" "$SR/src/lnk.txt"; pre d2 SubagentHandback; [[ "$(lastled "$SL" 4)" == no-change ]] && ok "L2: edit of a symlink -> ignored" || bad "L2: symlink edit"; rm "$SR/src/lnk.txt"
+ln -s "$SUP" "$SR/linkdir"; TA="$(agent d3)"; tr_edit "$TA" "$SR/linkdir/src/main.txt"; pre d3 SubagentHandback; [[ "$(lastled "$SL" 4)" == no-change ]] && ok "L2: edit through a symlinked folder out of roots -> ignored" || bad "L2: symlink dir edit"; rm "$SR/linkdir"
+SWT="$T/l2/svapp-wt"; git -C "$SR" worktree add -q "$SWT" -b swtb 2>/dev/null; SWTP="$(cd "$SWT" && pwd -P)"; echo BAD > "$SWT/src/main.txt"
+TA="$(agent d4)"; tr_edit "$TA" "$SWT/src/main.txt"; pre d4 SubagentHandback; lrc "L2: edit in a linked worktree of a trusted checkout -> checked -> 2" 2
+# other PreToolUse tools, missing pieces
+NL="$(wc -l < "$SL" | tr -d ' ')"; T0=$SECONDS
+pre a2 Bash; r1=$RC; o1="$OUT"; pre a2 Edit; r2=$RC; EL=$((SECONDS - T0))
+[[ $r1 == 0 && $RC == 0 && -z "$o1$OUT" && "$(wc -l < "$SL" | tr -d ' ')" == "$NL" ]] && ok "L2: other PreToolUse tools -> exit 0, no output, no ledger line" || bad "L2: other tools"
+(( EL <= 2 )) && ok "L2: ... instant (${EL}s for two calls)" || bad "L2: other tools slow (${EL}s)"
+pre "" SubagentHandback; lrc "L2: no agent_id -> 0" 0; has "L2: ... not verified" "$OUT" "not verified"
+pre aMissing SubagentHandback; lrc "L2: transcript file missing -> 0" 0; [[ "$(lastled "$SL" 4)" == no-transcript ]] && ok "L2: ... ledger no-transcript" || bad "L2: no-transcript"
+pre a2 SubagentHandback sOther; lrc "L2: wrong session folder (path is derived from session_id) -> 0" 0
+# SubagentStop input is understood too
+TA="$(agent e1)"; tr_edit "$TA" "$SR/src/main.txt"; setmain BAD
+printf '%s' "$(jq -nc --arg t "$TA" --arg c "$SRP" '{session_id:"s9",agent_id:"e1",hook_event_name:"SubagentStop",stop_hook_active:false,cwd:$c,agent_transcript_path:$t}')" | bash "$SV" >"$T/sout" 2>"$T/serr"; RC=$?
+lrc "L2: SubagentStop input still works -> 2" 2; has "L2: ... wording says finish" "$(cat "$T/serr")" "Before you finish"
+# block record cannot be written -> exit 0
+mkdir -p "$HOME/.claude/state/subagent-verify/sPre.f1.blocked"; TA="$(agent f1)"; tr_edit "$TA" "$SR/src/main.txt"; pre f1 SubagentHandback
+lrc "L2: block record not writable -> 0 (never an unrecorded block)" 0; has "L2: ... says so" "$OUT" "could not be written"
+# concurrency: 4 callbacks, same agent, same state -> one block
+TA="$(agent g1)"; tr_edit "$TA" "$SR/src/main.txt"
+for k in 1 2 3 4; do ( prein g1 SubagentHandback | bash "$SV" >/dev/null 2>&1; echo $? > "$T/conc.$k" ) & done; wait
+n2=0; for k in 1 2 3 4; do [[ "$(cat "$T/conc.$k")" == 2 ]] && n2=$((n2 + 1)); done
+[[ "$n2" == 1 && "$(wc -l < "$HOME/.claude/state/subagent-verify/sPre.g1.blocked" | tr -d ' ')" == 1 && ! -d "$HOME/.claude/state/subagent-verify/sPre.g1.lock" ]] && ok "L2: 4 concurrent calls -> exactly one block, one record, lock released" || bad "L2: concurrency ($n2 blocks)"
+# config gates
+rm -f "$SC"; TA="$(agent h1)"; tr_edit "$TA" "$SR/src/main.txt"; pre h1 SubagentHandback; [[ "$RC" == 0 && -z "$OUT" ]] && ok "L2: no config file -> 0, silent" || bad "L2: no config"
+echo '{}' > "$SC"; pre h1 SubagentHandback; [[ "$RC" == 0 && "$(lastled "$SL" 4)" == no-change ]] && ok "L2: repo not in config -> 0 (no-change)" || bad "L2: unregistered ($(tail -1 "$SL"))"
+sconf "$GOODCHK"; jq --arg x "$T/elsewhere" '.["acme/svapp"].roots = [$x]' "$SC" > "$SC.n" && mv "$SC.n" "$SC"; rm -f "$RAN"
+pre h1 SubagentHandback; [[ "$RC" == 0 && "$(runs)" == 0 ]] && ok "L2: checkout not in roots -> nothing run" || bad "L2: untrusted roots ran"
+# watchdog and installed-copy overrides
+sconf "$GOODCHK"; setmain BAD; printf '#!/bin/bash\nsleep 30\n' > "$T/gitshim/git"; chmod +x "$T/gitshim/git"
+TA="$(agent i1)"; tr_edit "$TA" "$SR/src/main.txt"; T0=$SECONDS; SENV=("PATH=$T/gitshim:$PATH" SUBVERIFY_TOTAL=5); pre i1 SubagentHandback; SENV=(); EL=$((SECONDS - T0))
+lrc "L2: hang while locating the repo -> 0 (outer watchdog)" 0; [[ "$(lastled "$SL" 4)" == timeout ]] && ok "L2: ... ledger timeout" || bad "L2: watchdog ledger"; (( EL <= 9 )) && ok "L2: ... returned in ${EL}s" || bad "L2: watchdog slow (${EL}s)"
+rm -f "$T/gitshim/git"
+mkdir -p "$HOME/.claude/hooks/lib"; cp "$SV" "$HOME/.claude/hooks/"; cp "$ROOT/hooks/lib/projects.sh" "$HOME/.claude/hooks/lib/"
+TA="$(agent i2)"; tr_edit "$TA" "$SR/src/main.txt"; rm -rf "$T/ovr2"
+prein i2 SubagentHandback | SUBVERIFY_STATE="$T/ovr2" bash "$SV" >/dev/null 2>&1
+[[ -s "$T/ovr2/ledger.tsv" ]] && ok "L2 control: the repo copy honours SUBVERIFY_STATE" || bad "L2 control: override not honoured"
+rm -rf "$T/ovr2" "$HOME/.claude/state/subagent-verify"; TA="$(agent i3)"; tr_edit "$TA" "$SR/src/main.txt"
+prein i3 SubagentHandback | SUBVERIFY_STATE="$T/ovr2" bash "$HOME/.claude/hooks/subagent-verify.sh" >/dev/null 2>&1; RC=$?
+lrc "L2: installed copy still works" 2; [[ ! -e "$T/ovr2" && -s "$SL" ]] && ok "L2: installed copy ignores SUBVERIFY_STATE" || bad "L2: installed copy honoured the override"
+printf '#!/bin/bash\nsleep 8\n' > "$T/gitshim/git"; chmod +x "$T/gitshim/git"; TA="$(agent i4)"; tr_edit "$TA" "$SR/src/main.txt"; T0=$SECONDS
+prein i4 SubagentHandback | PATH="$T/gitshim:$PATH" SUBVERIFY_TOTAL=3 bash "$HOME/.claude/hooks/subagent-verify.sh" >/dev/null 2>&1; EL=$((SECONDS - T0))
+(( EL >= 7 )) && ok "L2: installed copy ignores SUBVERIFY_TOTAL (watchdog not cut to 3 s)" || bad "L2: installed copy honoured SUBVERIFY_TOTAL (${EL}s)"
+rm -f "$T/gitshim/git" "$HOME/.claude/hooks/subagent-verify.sh"
+
 echo; echo "$pass passed, $fail failed"; (( fail == 0 ))

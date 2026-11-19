@@ -33,7 +33,7 @@ Lauren Tan's inverted pyramid, cheapest and most trusted first:
    - **Taste** (too wordy, looks generated) → `DESIGN.md` plus screenshots, video or audio for the human.
 4. **Is it just how to do a task?** → a skill or a script. Project rules go in the repo, where every agent can read them.
 
-Hooks: a failed check must `exit 2` (exit 1 counts as done). A hook timeout means nothing was checked, so the Stop hook keeps its own deadline below the hook timeout. A failure or an unfinished run blocks once per exact state; after that Claude may stop and sees NOT VERIFIED. Every verdict is appended to `~/.claude/state/stop-verify/ledger.tsv` (local, no paths). Checks wait while a subagent, workflow or `codex-dispatch.sh` runs and happen at the next stop. If the hook itself is broken (no `jq`), it exits 0 with a warning and never traps the session.
+Hooks: a failed check must `exit 2` (exit 1 counts as done). A hook timeout means nothing was checked, so the Stop hook keeps its own deadline below the hook timeout. A failure or an unfinished run blocks once per exact state; after that Claude may stop and sees NOT VERIFIED. Every verdict is appended to `~/.claude/state/stop-verify/ledger.tsv` (local, no paths). Checks wait while a subagent, workflow or `codex-dispatch.sh` runs and happen at the next stop. Two earlier layers use the same projects file: a PostToolUse hook runs a quick check after each edit and blocks only for errors in the edited file, and a PreToolUse hook on `SubagentHandback` runs the project's checks before a subagent that changed a trusted checkout may hand in its report. If the hook itself is broken (no `jq`), it exits 0 with a warning and never traps the session.
 
 ## 2. Who looks at what
 

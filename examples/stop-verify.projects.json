@@ -7,7 +7,14 @@
     "verify": "npx tsc --noEmit && npm test --silent",
     "requires": "node_modules",
     "limit": 300,
-    "tests_re": "^tests/|\\.test\\.(ts|tsx|js|mjs)$"
+    "tests_re": "^tests/|\\.test\\.(ts|tsx|js|mjs)$",
+    "edit_check": {
+      "files_re": "^(src|server)/.*\\.(ts|tsx)$",
+      "cmd": "npx tsc --noEmit --pretty false",
+      "limit": 20
+    },
+    "handback_verify": "npx tsc --noEmit && npm test --silent",
+    "handback_limit": 420
   },
   "your-name/my-db-app": {
     "roots": [

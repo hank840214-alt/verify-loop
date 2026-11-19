@@ -13,6 +13,8 @@ If you build software by talking to Claude Code, Codex or Gemini CLI, you cannot
 | `skills/verify-loop` | Say "verify". The model picks a mode: **start** (set 3–5 checkpoints first), **setup** (audit a repo's guardrails), **map** (feature map + a CLI that drives the real app), **triage** (turn a mistake into a check), **done** (evidence, blast radius, risk-tiered review). |
 | `skills/debug` | Say "debug". The model routes: ordinary bug, performance, state/timing, or blast radius. |
 | `hooks/stop-verify.sh` | A Stop hook. When the agent tries to finish in a registered repo with changed code, it runs that repo's checks. A failure or a timeout blocks once per exact state (`exit 2`); the same state is not re-run, and after that Claude may stop and sees NOT VERIFIED. With `tests_re` set, it also blocks, once, a change that edits code and existing tests together; it sees uncommitted edits only (committed test edits are listed by `verify-evidence.sh` for the reviewer). Its own errors never trap the session. |
+| `hooks/post-edit-check.sh` | A PostToolUse hook (`Edit`, `Write`, `MultiEdit`), layer 1. After an edit in a registered project that has an `edit_check`, it runs that quick check (for example `tsc`) and blocks (`exit 2`) only when the check fails and a line of its output names the file Claude just edited. Errors in other files are ignored. A timeout, a missing tool or its own error never blocks. |
+| `hooks/subagent-verify.sh` | A PreToolUse hook for `SubagentHandback`, layer 2. When a subagent is about to hand in its report, it works out from the subagent's own transcript whether it changed a trusted checkout, and if so runs the project's checks. A failure blocks the hand-back (`exit 2`) and the subagent keeps fixing. At most 2 blocks per subagent, once per exact state. |
 | `tools/codex-dispatch.sh` | Runs `codex exec` with an allowlist of flags only: read-only or workspace-write, network off by default for the commands Codex runs (the prompt and images still go to the model service; the caller can pass `--net`), no user config (no MCP servers, no notify hooks), workspace-write only in the current repo (or repos you list), the report file only under `<repo>/.scratch/` or `/tmp`. |
 | `tools/verify-evidence.sh` | Runs a check and prints a Markdown evidence block tied to the commit: SHA, command, exit code, log hash, the `node` and `python3` it found on `PATH` (add more with `--tool <name>`; paths are masked, but read that line before posting), and whether existing tests changed. A test added in the branch and edited again is listed under its own heading. The script does not change `PATH`: if the tools line shows a shim or an old interpreter, fix `PATH` and rerun. Refuses a dirty tree; exits 90 (INVALID) if the tree changes during the run or test edits cannot be checked. It prints no log text unless you pass `--tail N`, but it does print the full command. Local evidence helps a reviewer; it cannot see a command that edits files and puts them back. The real gate is CI rerunning on that SHA in a clean checkout. |
 | `docs/METHOD.md` | The method in one page. |
@@ -24,7 +26,7 @@ If you build software by talking to Claude Code, Codex or Gemini CLI, you cannot
 /plugin marketplace add hank840214-alt/verify-loop
 /plugin install verify-loop@verify-loop
 ```
-The plugin registers the Stop hook. It does nothing until you register a project.
+The plugin registers the Stop hook and the two new hooks. They do nothing until you register a project.
 
 ### Register a project for the Stop hook
 Copy `examples/stop-verify.projects.json` to `~/.claude/stop-verify.projects.json` and edit it. The key is `owner/repo` from your `origin` remote (for `git@github.com:alice/shop.git` it is `alice/shop`), so a different owner's clone with the same name never matches. `roots` is required: the absolute paths of the checkouts you trust. Any other checkout, even of the same repo, is never run.
@@ -42,6 +44,31 @@ Copy `examples/stop-verify.projects.json` to `~/.claude/stop-verify.projects.jso
 ```
 
 Optional `skip_re` names files that never trigger a run (generated files, leftovers of killed tests). Each verdict is appended to `~/.claude/state/stop-verify/ledger.tsv` (local, never printed, no full paths). Checks are skipped while a subagent, workflow or `codex-dispatch.sh` is running and happen at the next stop. `STOP_VERIFY_DEADLINE` (120..540 s, default 540) is the total time budget. To force a re-run of a failed state, change a file or delete `<state dir>/<id>.red`. `VERIFY_CHANGED_FILE` is newline-separated, so file names with newlines are not supported.
+
+### Quick check after each edit, and a check before a subagent reports
+Both hooks read the same projects file and use the same `roots` trust as the Stop hook. A project without the fields below is left alone by that hook.
+
+```json
+{
+  "your-name/my-web-app": {
+    "roots": ["/home/you/src/my-web-app"],
+    "verify": "npx tsc --noEmit && npm test --silent",
+    "edit_check": {
+      "files_re": "^(src|server)/.*\\.(ts|tsx)$",
+      "cmd": "npx tsc --noEmit --pretty false",
+      "limit": 20
+    },
+    "handback_verify": "npx tsc --noEmit && npm test --silent",
+    "handback_limit": 420
+  }
+}
+```
+
+- `edit_check` (layer 1): `files_re` is an extended regex on the repo-relative path; `cmd` is a bash command run at the repo root with `$EDIT_FILE` set to that path; `limit` is in seconds (1..22, default 20). The hook blocks only when `cmd` exits non-zero and some output line names the edited file, as a whole path (repo-relative or absolute). It shows at most 20 such lines. If `cmd` only reports other files, the edit passes. Make the tool print paths relative to the repo root.
+- `handback_verify` (layer 2): the command run when a subagent that changed this checkout hands in its report. Default: `verify`. It fails when it exits non-zero. Exit 124, 126, 127 or a kill by signal means "not verified", and the hand-back goes through. `$VERIFY_CHANGED_FILE` lists the files the subagent wrote with the edit tools.
+- `handback_limit`: seconds before that run is stopped as "not verified" (1..440, default 420; the hook timeout is 480).
+
+Ledgers: `~/.claude/state/post-edit-check/ledger.tsv` and `~/.claude/state/subagent-verify/ledger.tsv` (local, never printed).
 
 Before you register a project, ask the agent to run `/verify-loop setup`. It reads the test setup and lists steps that reset a database, deploy, send mail or call paid APIs. If tests reset a database, point `verify` at a throwaway one (see `my-db-app` in the example).
 
@@ -75,6 +102,11 @@ bash tests/run.sh
 - The stop hook does not look for files hidden with skip-worktree/assume-unchanged; the evidence script still refuses them.
 - Stops at the same time on one checkout can each run the checks and each block. A pass recorded by another session can hide this session's earlier failure of the same code.
 - The hook fires whenever a registered repo has changed code, including your own unfinished work. Claude is told to stop, not edit, when the failures are not from its session, but it may still try.
+- Layer 1 (`post-edit-check.sh`) runs after the edit. It cannot undo it; it only tells Claude. Only an output line that names the edited file blocks, so a tool that prints no paths never blocks.
+- Layer 2 (`subagent-verify.sh`) needs the `SubagentHandback` tool, the one a subagent calls to hand in its report. It was observed on recent Claude Code. On a host without it, the hook never fires and nothing is checked.
+- Layer 2 works on shared checkouts. A failure can come from another session's edit, so the block message says so and tells the subagent not to revert work that is not its own.
+- Layer 2 finds a subagent's Bash writes by matching strings (`>`, `sed -i`, `mv`, `git checkout`, and so on) and path names. It can miss a write, and it can count a harmless command. Read-only git (`status`, `log`, `diff`, `show`, `stash list`) does not count.
+- Layer 2 runs the whole `handback_verify` command, whatever file the subagent changed.
 - Codex in read-only mode can still read any file your user can read. The wrapper limits writes and network, not reads.
 - "Network off" is a Codex setting the wrapper passes (`sandbox_workspace_write.network_access=false`); the tests check the flag, not real traffic. Check it once on your Codex version.
 - Evidence blocks are meant for PRs. They show the full command and, with `--tail N`, the end of the log. Keep secrets out of command arguments (use environment variables) and read the whole block before you post it publicly.
