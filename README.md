@@ -92,7 +92,7 @@ From the first real runs, on one app with a server and a browser client. The dri
 - Produce evidence with a clean `PATH`. Two full runs showed 44 and 39 false failures from an old system interpreter and from a shim.
 - A new check can be flaky too. Keep only the one signal under test real, inject the rest, then put the old mistake back and see the check fail.
 - A flow that passes is not proof until the screenshot shows what the feature map promises. One flow passed on internal state while the thing it claimed was off screen, and later while it sat under an overlay. In that project the check now requires the visible label, uncovered, before and after the shot.
-- Drive the build players get. The first driver built without the production feature flags, so four flows passed on screens no player sees.
+- Drive the build your users get. The first driver built without the production feature flags, so four flows passed on screens no user sees.
 - Tie the picture to the code. A screenshot stamped with a commit id must come from that commit. That project's driver stamps an uncommitted build `+dirty` and refuses a running instance built from another state.
 - A verification tool that starts processes must prove a process is its own before it stops it. A recorded PID is not proof after a reboot; record the start time and command line too.
 - Every one of these was found by an independent reviewer or by rerunning, not by the session that wrote the code.
