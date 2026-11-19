@@ -11,17 +11,21 @@
 #            timeout / error and shown as a systemMessage; they never block.
 #
 # Config: the same projects file as stop-verify.sh (~/.claude/stop-verify.projects.json, or
-# $STOP_VERIFY_CONFIG), same "roots" trust. Optional field per project:
+# $STOP_VERIFY_CONFIG when that is an absolute path), same "roots" trust. Optional field per project:
 #   "edit_check": { "files_re": "<ERE on the repo-relative path>",
 #                   "cmd":      "<bash, run at the repo root; $EDIT_FILE = repo-relative path>",
 #                   "limit":    20 }          # seconds, 1..22, default 20
-# No edit_check -> this hook does nothing for that project.
+# No edit_check -> this hook does nothing for that project. "requires" (a path that must exist
+# under the repo root, as for stop-verify.sh) is honoured: if it is missing, the check is skipped.
 #
 # The path match is by whole path components (repo-relative or absolute): src/a.ts is not
-# lib/src/a.ts and not src/a.tsx. At most 20 diagnostic lines are shown.
+# lib/src/a.ts, not src/a.tsx, not src/a.ts~. ANSI colour codes are stripped before matching and
+# the check runs with NO_COLOR=1. The matcher only asks "does an output line name this file?";
+# it does not parse the diagnostic format. At most 20 diagnostic lines are shown.
 #
-# Whole decision runs under a watchdog (25 s; the plugin hook timeout is 30). The inner process
-# is started by us with --inner; an inherited variable cannot skip the watchdog.
+# The whole hook, including reading stdin, runs under a 25 s budget (the plugin hook timeout is
+# 30). The inner process is started by us with --inner; an inherited variable cannot skip the
+# watchdog, and a TERM to the hook is forwarded to the check's process group.
 # Test-only overrides POST_EDIT_STATE and POST_EDIT_LIMIT are ignored when this script lives
 # under ~/.claude (an installed copy or plugin). They never touch trust: trust is only "roots".
 # Ledger: ~/.claude/state/post-edit-check/ledger.tsv  (time, project, file, result, seconds)
@@ -29,7 +33,9 @@
 set -uo pipefail
 SELF="${BASH_SOURCE[0]}"
 SELF_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd -P)"
-CONF="${STOP_VERIFY_CONFIG:-$HOME/.claude/stop-verify.projects.json}"
+START=$SECONDS
+CONF="$HOME/.claude/stop-verify.projects.json"
+[[ "${STOP_VERIFY_CONFIG:-}" == /* ]] && CONF="$STOP_VERIFY_CONFIG"   # a relative path is ignored
 [[ -f "$CONF" ]] || exit 0
 STATE_DIR="$HOME/.claude/state/post-edit-check"
 TOTAL_LIMIT=25
@@ -43,25 +49,28 @@ INNER=0; for a in "$@"; do [[ "$a" == --inner ]] && INNER=1; done
 source "$SELF_DIR/lib/projects.sh" 2>/dev/null || exit 0
 
 led() {  # project, file, result, seconds
-  ( umask 077; mkdir -p "$STATE_DIR" &&
-    printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$(clean_tabs "$1")" "$(clean_tabs "$2")" "$3" "$4" >> "$STATE_DIR/ledger.tsv" ) 2>/dev/null
+  ledger_append "$STATE_DIR" "$1" "$2" "$3" "$4"
 }
 note() { jq -cn --arg m "[post-edit-check] $1" '{systemMessage:$m}' 2>/dev/null; }
+WARN='{"systemMessage":"[post-edit-check] %s; edit check skipped"}\n'
 
 # ---------- outer: watchdog around the whole decision ----------
 if (( INNER == 0 )); then
-  command -v jq >/dev/null 2>&1 || exit 0
-  command -v perl >/dev/null 2>&1 || exit 0
-  INPUT="$(cat)"
+  trap 'exit 143' TERM INT
+  command -v jq >/dev/null 2>&1 || { printf "$WARN" "jq missing"; exit 0; }
+  command -v perl >/dev/null 2>&1 || { printf "$WARN" "perl missing"; exit 0; }
+  READ_LIMIT=5; (( TOTAL_LIMIT <= 5 )) && READ_LIMIT=$((TOTAL_LIMIT - 1)); (( READ_LIMIT >= 1 )) || READ_LIMIT=1
+  INPUT="$(run_limited "$READ_LIMIT" cat)"; RC=$?
+  (( RC == 0 )) || { printf "$WARN" "stdin was not complete in ${READ_LIMIT} s"; exit 0; }
   OUTF="$(mktemp "${TMPDIR:-/tmp}/pec-out.XXXXXX")" || exit 0
   ERRF="$(mktemp "${TMPDIR:-/tmp}/pec-err.XXXXXX")" || { /bin/rm -f "$OUTF"; exit 0; }
   trap '/bin/rm -f "$OUTF" "$ERRF"' EXIT
-  T0=$SECONDS
-  printf '%s' "$INPUT" | run_limited "$TOTAL_LIMIT" bash "$SELF" --inner >"$OUTF" 2>"$ERRF"; RC=$?
+  LEFT=$((TOTAL_LIMIT - (SECONDS - START))); (( LEFT >= 1 )) || LEFT=1
+  printf '%s' "$INPUT" | run_limited "$LEFT" bash "$SELF" --inner >"$OUTF" 2>"$ERRF"; RC=$?
   if (( RC == 124 || (RC != 0 && RC != 2) )); then
     F="$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null)"
-    if (( RC == 124 )); then led "-" "$F" timeout "$((SECONDS - T0))"; note "Edit check timed out (${TOTAL_LIMIT} s); not verified."
-    else led "-" "$F" error "$((SECONDS - T0))"; note "Edit check failed by itself (rc=${RC}); not verified."; fi
+    if (( RC == 124 )); then led_bounded "$STATE_DIR" "-" "$F" timeout "$((SECONDS - START))"; note "Edit check timed out (${TOTAL_LIMIT} s); not verified."
+    else led_bounded "$STATE_DIR" "-" "$F" error "$((SECONDS - START))"; note "Edit check failed by itself (rc=${RC}); not verified."; fi
     exit 0
   fi
   cat "$OUTF"; cat "$ERRF" >&2
@@ -70,6 +79,7 @@ fi
 
 # ---------- inner ----------
 START=$SECONDS
+trap 'exit 143' TERM INT
 INPUT="$(cat)"
 j() { printf '%s' "$INPUT" | jq -r "$1" 2>/dev/null; }
 case "$(j '.tool_name // empty')" in ""|Edit|Write|MultiEdit) ;; *) exit 0 ;; esac
@@ -100,12 +110,16 @@ LIMIT="$(printf '%s' "$EC" | jq -r '.limit // 20 | floor')"
 [[ -n "$FILES_RE" && -n "$CMD" ]] || soft error "edit_check files_re and cmd must not be empty"
 re_ok "$FILES_RE" || soft error "edit_check files_re is not a valid regex"
 [[ "$REL" =~ $FILES_RE ]] || exit 0
-BUDGET=$((TOTAL_LIMIT - 3)); (( BUDGET >= 1 )) || BUDGET=1
+REQ="$(jq -r --arg k "$KEY" '.[$k].requires | if type == "string" then . else empty end' "$CONF" 2>/dev/null)"
+[[ -z "$REQ" || -e "$ROOT/$REQ" ]] || { L skip; exit 0; }
+BUDGET=$((TOTAL_LIMIT - 3 - (SECONDS - START))); (( BUDGET >= 1 )) || soft timeout "No time left for the check"
 [[ "$LIMIT" =~ ^[0-9]+$ ]] && (( LIMIT >= 1 && LIMIT <= BUDGET )) || LIMIT=$BUDGET
 
 OUT="$(mktemp "${TMPDIR:-/tmp}/post-edit-check.XXXXXX")" || exit 0
 trap '/bin/rm -f "$OUT"' EXIT
-export NPM_CONFIG_UPDATE_NOTIFIER=false
+export NPM_CONFIG_UPDATE_NOTIFIER=false NO_COLOR=1
+# Run from the directory that was verified above, and say so if that is no longer true.
+( cd "$ROOT" 2>/dev/null && [[ "$(pwd -P)" == "$ROOT" ]] ) || soft error "Cannot enter the checkout"
 ( cd "$ROOT" && EDIT_FILE="$REL" run_limited "$LIMIT" bash -c "$CMD" ) </dev/null >"$OUT" 2>&1; RC=$?
 [[ -f "$FILE" ]] || soft error "The file disappeared during the check"
 (( RC == 0 )) && { L pass; exit 0; }
@@ -117,11 +131,12 @@ HITS="$(perl -e '
   my ($rel, $abs) = @ARGV;
   while (my $l = <STDIN>) {
     chomp $l;
+    (my $c = $l) =~ s/\e\[[0-9;?]*[ -\/]*[@-~]//g;
     for my $n ($abs, $rel) {
-      next if $n eq "";
-      if ($l =~ /(?<![\w.\/@~-])(?:\.\/)?\Q$n\E(?![\w\/-]|\.\w)/) { print "$l\n"; last }
+      next if !defined $n || $n eq "";
+      if ($c =~ /(?<![\w.\/@~-])(?:\.\/)?\Q$n\E(?![\w\/~-]|\.\w)/) { print "$c\n"; last }
     }
-  }' "$REL" "$ABS" < "$OUT" 2>/dev/null)"
+  }' -- "$REL" "$ABS" < "$OUT" 2>/dev/null)"
 if [[ -z "$HITS" ]]; then L pass; exit 0; fi
 L block
 NH="$(printf '%s\n' "$HITS" | wc -l | tr -d ' ')"

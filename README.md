@@ -46,7 +46,7 @@ Copy `examples/stop-verify.projects.json` to `~/.claude/stop-verify.projects.jso
 Optional `skip_re` names files that never trigger a run (generated files, leftovers of killed tests). Each verdict is appended to `~/.claude/state/stop-verify/ledger.tsv` (local, never printed, no full paths). Checks are skipped while a subagent, workflow or `codex-dispatch.sh` is running and happen at the next stop. `STOP_VERIFY_DEADLINE` (120..540 s, default 540) is the total time budget. To force a re-run of a failed state, change a file or delete `<state dir>/<id>.red`. `VERIFY_CHANGED_FILE` is newline-separated, so file names with newlines are not supported.
 
 ### Quick check after each edit, and a check before a subagent reports
-Both hooks read the same projects file and use the same `roots` trust as the Stop hook. A project without the fields below is left alone by that hook.
+Both hooks read the same projects file and use the same `roots` trust as the Stop hook. They are opt-in: a project without `edit_check` is left alone by layer 1, and a project without `handback_verify` is left alone by layer 2 (its Stop-hook `verify` is never run by layer 2). Each hook runs your command as your user, outside Claude Code's sandbox, at a time the Stop hook did not: layer 1 after every matching edit, layer 2 when a subagent that changed a checkout hands in its report. `$STOP_VERIFY_CONFIG` is used only when it is an absolute path.
 
 ```json
 {
@@ -64,8 +64,8 @@ Both hooks read the same projects file and use the same `roots` trust as the Sto
 }
 ```
 
-- `edit_check` (layer 1): `files_re` is an extended regex on the repo-relative path; `cmd` is a bash command run at the repo root with `$EDIT_FILE` set to that path; `limit` is in seconds (1..22, default 20). The hook blocks only when `cmd` exits non-zero and some output line names the edited file, as a whole path (repo-relative or absolute). It shows at most 20 such lines. If `cmd` only reports other files, the edit passes. Make the tool print paths relative to the repo root.
-- `handback_verify` (layer 2): the command run when a subagent that changed this checkout hands in its report. Default: `verify`. It fails when it exits non-zero. Exit 124, 126, 127 or a kill by signal means "not verified", and the hand-back goes through. `$VERIFY_CHANGED_FILE` lists the files the subagent wrote with the edit tools.
+- `edit_check` (layer 1): `files_re` is an extended regex on the repo-relative path; `cmd` is a bash command run at the repo root with `$EDIT_FILE` set to that path; `limit` is in seconds (1..22, default 20). The hook blocks only when `cmd` exits non-zero and some output line names the edited file, as a whole path (repo-relative or absolute). It shows at most 20 such lines. If `cmd` only reports other files, the edit passes. Make the tool print paths relative to the repo root. ANSI colour codes are stripped before matching and `NO_COLOR=1` is set. If `requires` is set and missing, the check is skipped. The matcher only asks whether an output line names the file; it does not parse the diagnostic format, so a status line that mentions the file next to an error in another file can still block.
+- `handback_verify` (layer 2): the command run when a subagent that changed this checkout hands in its report. There is no fallback to `verify`; without this field layer 2 does nothing for the project. It fails when it exits non-zero. Exit 124, 126, 127 or a kill by signal means "not verified", and the hand-back goes through. `$VERIFY_CHANGED_FILE` lists the files the subagent wrote with the edit tools.
 - `handback_limit`: seconds before that run is stopped as "not verified" (1..440, default 420; the hook timeout is 480).
 
 Ledgers: `~/.claude/state/post-edit-check/ledger.tsv` and `~/.claude/state/subagent-verify/ledger.tsv` (local, never printed).
@@ -107,6 +107,7 @@ bash tests/run.sh
 - Layer 2 works on shared checkouts. A failure can come from another session's edit, so the block message says so and tells the subagent not to revert work that is not its own.
 - Layer 2 finds a subagent's Bash writes by matching strings (`>`, `sed -i`, `mv`, `git checkout`, and so on) and path names. It can miss a write, and it can count a harmless command. Read-only git (`status`, `log`, `diff`, `show`, `stash list`) does not count.
 - Layer 2 runs the whole `handback_verify` command, whatever file the subagent changed.
+- Both hooks check trust, then start the command later. If someone swaps a linked worktree for a symlink in between, the command can run in the wrong place. That race is not defended against.
 - Codex in read-only mode can still read any file your user can read. The wrapper limits writes and network, not reads.
 - "Network off" is a Codex setting the wrapper passes (`sandbox_workspace_write.network_access=false`); the tests check the flag, not real traffic. Check it once on your Codex version.
 - Evidence blocks are meant for PRs. They show the full command and, with `--tail N`, the end of the log. Keep secrets out of command arguments (use environment variables) and read the whole block before you post it publicly.
@@ -134,7 +135,7 @@ From the first day of the two edit and hand-back hooks, on the same project (two
 
 - Unit tests are not enough for a hook; run it once in the real host. The first layer-2 version listened for the subagent's stop event and passed 212 unit tests. In real use it logged two failures and nothing was fixed: by the time the block arrived, the subagent had already handed in. Moving it to the hand-back tool call gave one full fail → fix → pass cycle.
 - Set the time limit from runs on a busy machine. The full test suite took 133–226 s under load, against an estimated 100–130 s when idle. A first limit of 200 s meant every busy run ended as "not verified".
-- A file the checker does not cover is skipped, not passed. That project's type-check config covered only two of its folders, so edits elsewhere were logged as `skip`.
+- A file the checker does not cover is skipped, not passed. That project's type-check config covered only two of its folders, so edits elsewhere were skipped, not checked (the private version that ran then logged them as `skip`).
 - Most subagents change nothing. 11 of 17 layer-2 entries were read-only subagents, so the check cost them nothing.
 - The quick check paid off at once: three blocks after an edit, each fixed by the next edit 4–6 s later. Each check took 2–6 s. No false blocks yet.
 

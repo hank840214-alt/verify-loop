@@ -16,13 +16,17 @@
 # Only checkouts listed in "roots" of the projects file count (same trust as stop-verify.sh).
 # If there is one, run that project's check at its root.
 #
-# Config, same projects file as stop-verify.sh. Optional fields per project:
-#   handback_verify   bash command to run (default: the project's "verify")
+# Config, same projects file as stop-verify.sh ($STOP_VERIFY_CONFIG is used only when it is an
+# absolute path). Opt-in per project: a project without "handback_verify" is never checked here.
+#   handback_verify   bash command to run at the checkout root (no fallback to "verify")
 #   handback_limit    seconds before the run is stopped as "not verified" (1..440, default 420)
+#   requires          optional path that must exist under the root, as for stop-verify.sh
 # $VERIFY_CHANGED_FILE names a file listing the repo-relative paths the subagent wrote with the
 # edit tools (empty when only Bash wrote).
-#   exit 2   only when the command exits non-zero (not 124 / 126 / 127 / killed by a signal), at
-#            most 2 blocks per agent, once per fingerprint (path + HEAD + diff + untracked files).
+#   exit 2   only when the command exits non-zero (not 124 / 126 / 127 / killed by a signal, and it
+#            must have been started), at most 2 blocks per agent, once per fingerprint (path +
+#            HEAD + diff + untracked files; a repo with no commit, or any step that cannot be
+#            listed or hashed, means "not verified", never a fingerprint).
 #            The block record is written under a lock and re-checked inside it; if it cannot be
 #            written the hook exits 0 instead.
 #   exit 0   everything else (no transcript, no change, untrusted path, timeout, missing tool,
@@ -30,15 +34,17 @@
 # Known limit: checkouts are shared between sessions, so a failure may come from another
 #   session's edit. The block message says so.
 #
-# Whole decision runs under a watchdog (460 s; the plugin hook timeout is 480), started by us with
-# --inner. Test-only overrides SUBVERIFY_STATE and SUBVERIFY_TOTAL are ignored when this script
+# The whole hook, including reading stdin, runs under a 460 s budget (the plugin hook timeout is
+# 480); the inner process is started by us with --inner and a TERM is forwarded to the check. Test-only overrides SUBVERIFY_STATE and SUBVERIFY_TOTAL are ignored when this script
 # lives under ~/.claude. They never touch trust: trust is only "roots".
 # Ledger: ~/.claude/state/subagent-verify/ledger.tsv  (time, project, agent, result, seconds)
 #   result: pass | fail | timeout | error | repeat | capped | no-change | no-transcript | skip
 set -uo pipefail
 SELF="${BASH_SOURCE[0]}"
 SELF_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd -P)"
-CONF="${STOP_VERIFY_CONFIG:-$HOME/.claude/stop-verify.projects.json}"
+START=$SECONDS
+CONF="$HOME/.claude/stop-verify.projects.json"
+[[ "${STOP_VERIFY_CONFIG:-}" == /* ]] && CONF="$STOP_VERIFY_CONFIG"   # a relative path is ignored
 [[ -f "$CONF" ]] || exit 0
 STATE_DIR="$HOME/.claude/state/subagent-verify"
 TOTAL_LIMIT=460
@@ -54,26 +60,30 @@ source "$SELF_DIR/lib/projects.sh" 2>/dev/null || exit 0
 
 msg() { jq -cn --arg m "[subagent-verify] $1" '{systemMessage:$m}' 2>/dev/null; }
 led() {  # project, result   (needs AGENT, START)
-  ( umask 077; mkdir -p "$STATE_DIR" &&
-    printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$(clean_tabs "$1")" "${AGENT:0:8}" "$2" "$((SECONDS - START))" >> "$STATE_DIR/ledger.tsv" ) 2>/dev/null
+  ledger_append "$STATE_DIR" "$1" "${AGENT:0:8}" "$2" "$((SECONDS - START))"
 }
+WARN='{"systemMessage":"[subagent-verify] %s; subagent check skipped"}\n'
 
 # ---------- outer: watchdog around the whole decision ----------
 if (( INNER == 0 )); then
-  INPUT="$(cat)"
-  # Cheap exit for every other tool call: no process is started.
+  trap 'exit 143' TERM INT
+  # Reading stdin is bounded too (without perl it cannot be, and is read plainly).
+  RC=0
+  if command -v perl >/dev/null 2>&1; then INPUT="$(run_limited 5 cat)"; RC=$?; else INPUT="$(cat)"; fi
+  # Cheap exit for every other tool call: nothing else is started.
   case "$INPUT" in *SubagentHandback*|*SubagentStop*) ;; *) exit 0 ;; esac
-  command -v jq >/dev/null 2>&1 || exit 0
-  command -v perl >/dev/null 2>&1 || exit 0
-  START=$SECONDS
+  command -v jq >/dev/null 2>&1 || { printf "$WARN" "jq missing"; exit 0; }
+  command -v perl >/dev/null 2>&1 || { printf "$WARN" "perl missing"; exit 0; }
+  (( RC == 0 )) || { printf "$WARN" "stdin was not complete in 5 s"; exit 0; }
   OUTF="$(mktemp "${TMPDIR:-/tmp}/sv-out.XXXXXX")" || exit 0
   ERRF="$(mktemp "${TMPDIR:-/tmp}/sv-err.XXXXXX")" || { /bin/rm -f "$OUTF"; exit 0; }
   trap '/bin/rm -f "$OUTF" "$ERRF"' EXIT
-  printf '%s' "$INPUT" | run_limited "$TOTAL_LIMIT" bash "$SELF" --inner >"$OUTF" 2>"$ERRF"; RC=$?
+  LEFT=$((TOTAL_LIMIT - (SECONDS - START))); (( LEFT >= 1 )) || LEFT=1
+  printf '%s' "$INPUT" | run_limited "$LEFT" bash "$SELF" --inner >"$OUTF" 2>"$ERRF"; RC=$?
   if (( RC == 124 || (RC != 0 && RC != 2) )); then
     AGENT="$(printf '%s' "$INPUT" | jq -r '.agent_id // "noagent"' 2>/dev/null)"; AGENT="${AGENT//[^A-Za-z0-9_-]/_}"
-    if (( RC == 124 )); then led "-" timeout; msg "Subagent check timed out (${TOTAL_LIMIT} s); not verified."
-    else led "-" error; msg "Subagent check failed by itself (rc=${RC}); not verified."; fi
+    if (( RC == 124 )); then led_bounded "$STATE_DIR" "-" "${AGENT:0:8}" timeout "$((SECONDS - START))"; msg "Subagent check timed out (${TOTAL_LIMIT} s); not verified."
+    else led_bounded "$STATE_DIR" "-" "${AGENT:0:8}" error "$((SECONDS - START))"; msg "Subagent check failed by itself (rc=${RC}); not verified."; fi
     exit 0
   fi
   cat "$OUTF"; cat "$ERRF" >&2
@@ -82,6 +92,14 @@ fi
 
 # ---------- inner ----------
 START=$SECONDS
+LOG=""; LIST=""; NOSTART=""; XF1=""; XF2=""; FPD=""; FPU=""; FPF=""; LOCKHELD=0; LOCKD=""
+cleanup() {
+  /bin/rm -f "$LOG" "$LIST" "$NOSTART" "$XF1" "$XF2" "$FPD" "$FPU" "$FPF" 2>/dev/null
+  (( LOCKHELD )) && [[ -n "$LOCKD" ]] && rmdir "$LOCKD" 2>/dev/null
+  return 0
+}
+trap cleanup EXIT
+trap 'exit 143' TERM INT
 BUDGET=$((TOTAL_LIMIT - 10)); (( BUDGET >= 5 )) || BUDGET=5
 INPUT="$(cat)"
 j() { printf '%s' "$INPUT" | jq -r "$1" 2>/dev/null; }
@@ -97,14 +115,15 @@ if [[ "$EVENT" != SubagentStop ]]; then
   # Any other tool: nothing to do. The subagent's transcript path is derived:
   # dirname(transcript_path)/<session_id>/subagents/agent-<agent_id>.jsonl
   [[ "$TOOLN" == SubagentHandback ]] || exit 0
-  PRE=1; T=""
+  PRE=1
   MT="$(j '.transcript_path // empty')"; MT="${MT/#\~/$HOME}"; RAWS="$(j '.session_id // empty')"
-  if [[ -n "$MT" && -n "$RAWS" && -n "$AGENT" ]]; then T="$(dirname "$MT")/$RAWS/subagents/agent-$AGENT.jsonl"; fi
+  if [[ -z "$T" && -n "$MT" && -n "$RAWS" && -n "$AGENT" ]]; then T="$(dirname "$MT")/$RAWS/subagents/agent-$AGENT.jsonl"; fi
 fi
 [[ -n "$AGENT" ]] || AGENT="$(basename "${T:-noagent}" .jsonl)"
 AGENT="${AGENT//[^A-Za-z0-9_-]/_}"
 
 (umask 077; mkdir -p "$STATE_DIR") 2>/dev/null || { msg "Cannot create the state folder; not verified."; exit 0; }
+find "$STATE_DIR" -name '*.blocked' -mtime +7 -delete 2>/dev/null
 [[ -n "$HASH" ]] || { led "-" error; msg "shasum/sha1sum missing; not verified."; exit 0; }
 # No fallback to the main session transcript: it would blame the subagent for the parent's edits.
 if [[ -z "$T" || ! -f "$T" ]]; then
@@ -130,19 +149,24 @@ FILES_JQ="$OK_JQ"'
       | (.input.file_path // .input.notebook_path // empty)
       | select(type == "string" and startswith("/")) ]
   | unique | .[] | . + "\u0000"'
-# Bash calls with a write sign: prints cwd NUL command NUL
+# Bash calls with a write sign: prints cwd NUL command NUL. A call whose result was an error still
+# counts: a command can write and then fail.
 BASH_JQ="$OK_JQ"'
   | $all[] | select(.type == "assistant") | (.cwd // "") as $cwd | .message.content? | arrays | .[]
-    | select(type == "object" and .type == "tool_use" and .name == "Bash" and ($ok[.id // ""] == true))
+    | select(type == "object" and .type == "tool_use" and .name == "Bash")
     | (.input.command // "" | tostring) as $c
     | ($c | gsub("[0-9]?>&[0-9]"; "") | gsub("[0-9]?>>? ?/dev/null"; "")) as $x
     | select($x | test(">|>>|sed +(-[A-Za-z]+ +)*-i|git apply|(^|[;&|(] *)(mv|cp|rm|tee|patch|install) |git +(-[Cc] +.*[ \"])?(checkout|switch|reset|restore|apply|am|merge|rebase|cherry-pick|commit|rm|mv|clean|stash( +(push|pop|apply|drop|save|clear|branch|create|store)|( +-[-A-Za-z]+)*( *$| *[;&|])))|\\.write_text|\\.write_bytes|writeFileSync"))
     | ($cwd + "\u0000" + $c + "\u0000")'
-PLIST=(); while IFS= read -r -d '' f; do PLIST+=("$f"); done < <(jq -nj "$FILES_JQ" "$T" 2>/dev/null; )
-BASHL=(); while IFS= read -r -d '' f; do BASHL+=("$f"); done < <(jq -nj "$BASH_JQ" "$T" 2>/dev/null; )
+XF1="$(mktemp "${TMPDIR:-/tmp}/sv-x1.XXXXXX")" && XF2="$(mktemp "${TMPDIR:-/tmp}/sv-x2.XXXXXX")" || { led "-" error; msg "Cannot create a temp file; not verified."; exit 0; }
+if ! jq -nj "$FILES_JQ" "$T" >"$XF1" 2>/dev/null || ! jq -nj "$BASH_JQ" "$T" >"$XF2" 2>/dev/null; then
+  led "-" error; msg "The subagent's transcript could not be read for edits; not verified."; exit 0
+fi
+PLIST=(); while IFS= read -r -d '' f; do PLIST+=("$f"); done < "$XF1"
+BASHL=(); while IFS= read -r -d '' f; do BASHL+=("$f"); done < "$XF2"
 
 NOTES=""
-UROOTS=(); UKEYS=()
+UROOTS=(); UKEYS=(); EF=(); ER=()   # EF/ER: validated edited files and their checkout
 add_root() { local u; for u in ${UROOTS[@]+"${UROOTS[@]}"}; do [[ "$u" == "$1" ]] && return; done; UROOTS+=("$1"); UKEYS+=("$2"); }
 
 # 1a. structured edits
@@ -152,7 +176,12 @@ for f in ${PLIST[@]+"${PLIST[@]}"}; do
   if [[ -L "$f" ]]; then continue; fi
   d="$(cd "$(dirname "$f")" 2>/dev/null && pwd -P)" || { GONE=$((GONE + 1)); continue; }
   if [[ "$d" != "$CD_LAST" ]]; then CD_LAST="$d"; if resolve_trusted "$d"; then CR_LAST="$R_ROOT"; CK_LAST="$R_KEY"; else CR_LAST=""; fi; fi
-  [[ -n "$CR_LAST" ]] && add_root "$CR_LAST" "$CK_LAST"
+  if [[ -n "$CR_LAST" ]]; then
+    add_root "$CR_LAST" "$CK_LAST"
+    # only a regular file, inside the checkout, with a name a one-per-line list can carry
+    pf="$d/${f##*/}"
+    if [[ "$pf" == "$CR_LAST"/* && "$pf" != *$'\n'* ]]; then EF+=("$pf"); ER+=("$CR_LAST"); fi
+  fi
 done
 (( GONE > 0 )) && NOTES+="${GONE} written files no longer exist and were skipped. "
 
@@ -177,10 +206,13 @@ if (( ${#BASHL[@]} > 0 )); then
     # resolve_trusted about the nearest existing directory of the target (a deleted file's parent)
     for d in ${CANDS[@]+"${CANDS[@]}"}; do
       for form in "$d" "${d// /\\ }"; do
-        rest="$cmd"
+        rest="$cmd"; acc=""
         while [[ "$rest" == *"$form"* ]]; do
-          rest="${rest#*"$form"}"
+          acc="$acc${rest%%"$form"*}"; lc="${acc: -1}"
+          rest="${rest#*"$form"}"; acc="$acc$form"
           nx="${rest:0:1}"
+          # left boundary: the path starts the word (a quote, space, =, :, ; & | ( ` < > or the start)
+          if [[ -n "$lc" && "$lc" != [[:space:]] && "$lc" != [\"\'=:\;\&\|\(\`\<\>] ]]; then continue; fi
           if [[ -z "$nx" || "$nx" == [/\"\'\;\&\|\<\>\(\)\`] || "$nx" == [[:space:]] ]]; then
             tail="${rest%%[[:space:]\"\'\;\&\|\<\>\(\)\`]*}"
             tp="$d$tail"
@@ -207,64 +239,92 @@ sleep_s() { perl -e 'select(undef,undef,undef,$ARGV[0])' "$1"; }
 lock_acquire() {
   local n=0
   while (( n < 100 )); do
-    mkdir "$LOCKD" 2>/dev/null && return 0
+    if mkdir "$LOCKD" 2>/dev/null; then LOCKHELD=1; return 0; fi
     if [[ -n "$(find "$LOCKD" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then rmdir "$LOCKD" 2>/dev/null; fi
     sleep_s 0.1; n=$((n + 1))
   done
   return 1
 }
-lock_release() { rmdir "$LOCKD" 2>/dev/null; }
-bf_count() { local n=0; [[ -f "$BF" ]] && n="$(wc -l < "$BF" 2>/dev/null | tr -d ' ')"; [[ "$n" =~ ^[0-9]+$ ]] || n=0; printf '%s' "$n"; }
-fingerprint() {  # root -> hash of path + HEAD + git diff HEAD + untracked paths and content hashes
-  local r="$1"
-  { printf '%s\0' "$r"
-    git -C "$r" rev-parse HEAD 2>/dev/null || echo nohead
-    git -C "$r" diff HEAD 2>/dev/null | "$HASH"
-    git -C "$r" ls-files -z --others --exclude-standard 2>/dev/null | while IFS= read -r -d '' f; do
-      printf '%s\0' "$f"; "$HASH" < "$r/$f" 2>/dev/null || echo unreadable
-    done | "$HASH"
-  } | "$HASH" | cut -c1-40
+lock_release() { rmdir "$LOCKD" 2>/dev/null; LOCKHELD=0; }
+bf_count() {  # prints the number of blocks recorded; fails if the record exists but cannot be read
+  local n=0
+  if [[ -e "$BF" ]]; then n="$(wc -l 2>/dev/null < "$BF")" || return 1; n="${n//[[:space:]]/}"; fi
+  [[ "$n" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$n"
+}
+fingerprint() {  # root -> prints a hash; fails (prints nothing) if any step cannot be listed or hashed
+  local r="$1" rc
+  FPD="$(mktemp "${TMPDIR:-/tmp}/sv-fd.XXXXXX")" || return 1
+  FPU="$(mktemp "${TMPDIR:-/tmp}/sv-fu.XXXXXX")" || { /bin/rm -f "$FPD"; return 1; }
+  FPF="$(mktemp "${TMPDIR:-/tmp}/sv-ff.XXXXXX")" || { /bin/rm -f "$FPD" "$FPU"; return 1; }
+  (
+    printf '%s\0' "$r"
+    git -C "$r" rev-parse -q --verify HEAD || exit 1                       # no commit yet -> not verified
+    git -C "$r" -c core.fsmonitor=false diff --no-ext-diff --no-textconv HEAD >"$FPD" 2>/dev/null || exit 1
+    "$HASH" < "$FPD" || exit 1
+    git -C "$r" -c core.fsmonitor=false ls-files -z --others --exclude-standard >"$FPU" 2>/dev/null || exit 1
+    while IFS= read -r -d '' f; do
+      printf '%s\0' "$f"
+      if [[ -L "$r/$f" ]]; then printf 'link %s\n' "$(readlink "$r/$f")"          # never follow a link
+      elif [[ -f "$r/$f" ]]; then "$HASH" < "$r/$f" || exit 1
+      else echo other; fi                                                          # fifo, socket, device
+    done < "$FPU"
+  ) >"$FPF" 2>/dev/null; rc=$?
+  if (( rc == 0 )); then "$HASH" < "$FPF" | cut -c1-40; fi
+  /bin/rm -f "$FPD" "$FPU" "$FPF"
+  return $rc
 }
 
 FAIL_TEXT=""; RC=0; PASS_TEXT=""; k=0
 for ROOT in "${UROOTS[@]}"; do
   KEY="${UKEYS[$k]}"; k=$((k + 1))
   NAME="${ROOT##*/}"
-  if ! jq -e --arg k "$KEY" '.[$k] | ((has("handback_verify") | not) or (.handback_verify | type) == "string") and ((has("verify") | not) or (.verify | type) == "string") and ((has("requires") | not) or (.requires | type) == "string") and ((has("handback_limit") | not) or (.handback_limit | type) == "number")' "$CONF" >/dev/null 2>&1; then
-    led "$KEY" error; NOTES+="$NAME: handback_verify / verify / requires must be strings and handback_limit a number; not verified. "; continue
+  if ! jq -e --arg k "$KEY" '.[$k] | ((has("handback_verify") | not) or (.handback_verify | type) == "string") and ((has("requires") | not) or (.requires | type) == "string") and ((has("handback_limit") | not) or (.handback_limit | type) == "number")' "$CONF" >/dev/null 2>&1; then
+    led "$KEY" error; NOTES+="$NAME: handback_verify / requires must be strings and handback_limit a number; not verified. "; continue
   fi
-  VERIFY="$(pfield "$KEY" handback_verify)"; [[ -n "$VERIFY" ]] || VERIFY="$(pfield "$KEY" verify)"
+  VERIFY="$(pfield "$KEY" handback_verify)"
+  # Opt-in: a project without handback_verify is not checked here, and says nothing.
+  if ! jq -e --arg k "$KEY" '.[$k] | has("handback_verify")' "$CONF" >/dev/null 2>&1; then led "$KEY" skip; continue; fi
   REQ="$(pfield "$KEY" requires)"
   LIMIT="$(jq -r --arg k "$KEY" '.[$k].handback_limit // 420 | floor' "$CONF" 2>/dev/null)"
-  if [[ -z "$VERIFY" ]]; then led "$KEY" skip; NOTES+="$NAME: no handback_verify or verify command; not verified. "; continue; fi
-  if ! { [[ "$LIMIT" =~ ^[0-9]{1,4}$ ]] && LIMIT=$((10#$LIMIT)) && (( LIMIT >= 1 && LIMIT <= BUDGET )) && (( LIMIT <= 440 )); }; then
-    led "$KEY" error; NOTES+="$NAME: handback_limit must be 1-$(( BUDGET < 440 ? BUDGET : 440 )) seconds; not verified. "; continue
+  if [[ -z "$VERIFY" ]]; then led "$KEY" error; NOTES+="$NAME: handback_verify is empty; not verified. "; continue; fi
+  if ! { [[ "$LIMIT" =~ ^[0-9]{1,4}$ ]] && LIMIT=$((10#$LIMIT)) && (( LIMIT >= 1 && LIMIT <= 440 )); }; then
+    led "$KEY" error; NOTES+="$NAME: handback_limit must be 1-440 seconds; not verified. "; continue
   fi
   if [[ -n "$REQ" && ! -e "$ROOT/$REQ" ]]; then led "$KEY" skip; NOTES+="$NAME: $REQ is missing; not verified. "; continue; fi
 
   FP="$(fingerprint "$ROOT")"
-  if [[ ${#FP} != 40 ]]; then led "$KEY" error; NOTES+="$NAME: could not fingerprint the changes; not verified. "; continue; fi
+  if [[ ${#FP} != 40 ]]; then led "$KEY" error; NOTES+="$NAME: could not list or hash the changes (a repo with no commit, or an unreadable file); not verified. "; continue; fi
   if grep -qxF "$FP" "$BF" 2>/dev/null; then
     led "$KEY" repeat; NOTES+="$NAME: this exact state was already blocked once and is not re-run; not verified. "; continue
   fi
-  NBLK="$(bf_count)"
+  NBLK="$(bf_count)" || { led "$KEY" error; NOTES+="$NAME: the block record cannot be read; not verified. "; continue; }
   if (( NBLK >= MAX_BLOCKS )); then
     led "$KEY" capped; NOTES+="$NAME: this agent was already blocked ${NBLK} times (limit ${MAX_BLOCKS}); not verified. "; continue
   fi
-  LEFT=$((BUDGET - (SECONDS - START)))
-  if (( LEFT < 3 )); then led "$KEY" timeout; NOTES+="$NAME: out of time; not verified. "; continue; fi
-  (( LIMIT < LEFT )) && LEFT=$LIMIT
 
-  LOG="$(mktemp "${TMPDIR:-/tmp}/subagent-verify.XXXXXX")" || { led "$KEY" error; NOTES+="Cannot create a temp file; not verified. "; continue; }
-  LIST="$(mktemp "${TMPDIR:-/tmp}/subagent-verify-list.XXXXXX")" || { /bin/rm -f "$LOG"; led "$KEY" error; NOTES+="Cannot create a temp file; not verified. "; continue; }
-  for f in ${PLIST[@]+"${PLIST[@]}"}; do
-    pf="$(cd "$(dirname "$f")" 2>/dev/null && pwd -P)/${f##*/}"
-    [[ "$pf" == "$ROOT"/* ]] && printf '%s\n' "${pf#"$ROOT"/}"
+  LOG="$(mktemp "${TMPDIR:-/tmp}/subagent-verify.XXXXXX")" || { LOG=""; led "$KEY" error; NOTES+="Cannot create a temp file; not verified. "; continue; }
+  LIST="$(mktemp "${TMPDIR:-/tmp}/subagent-verify-list.XXXXXX")" || { LIST=""; led "$KEY" error; NOTES+="Cannot create a temp file; not verified. "; continue; }
+  NOSTART="$LIST.nostart"
+  # the list holds only files that passed validation, for this checkout
+  i=0
+  while (( i < ${#EF[@]} )); do
+    pf="${EF[$i]}"
+    if [[ "${ER[$i]}" == "$ROOT" && -f "$pf" && ! -L "$pf" ]]; then printf '%s\n' "${pf#"$ROOT"/}"; fi
+    i=$((i + 1))
   done > "$LIST"
+  LEFT=$((BUDGET - (SECONDS - START)))   # recomputed right before the run
+  if (( LEFT < 3 )); then led "$KEY" timeout; NOTES+="$NAME: out of time; not verified. "; /bin/rm -f "$LOG" "$LIST"; LOG=""; LIST=""; continue; fi
+  (( LIMIT < LEFT )) && LEFT=$LIMIT
   T0=$SECONDS
-  ( cd "$ROOT" && VERIFY_CHANGED_FILE="$LIST" run_limited "$LEFT" bash -c "$VERIFY" ) </dev/null >"$LOG" 2>&1
+  ( cd "$ROOT" 2>/dev/null && [[ "$(pwd -P)" == "$ROOT" ]] || { : > "$NOSTART"; exit 1; }
+    VERIFY_CHANGED_FILE="$LIST" run_limited "$LEFT" bash -c "$VERIFY" ) </dev/null >"$LOG" 2>&1
   TRC=$?
-  EL=$((SECONDS - T0)); /bin/rm -f "$LIST"
+  EL=$((SECONDS - T0))
+  if [[ -e "$NOSTART" ]]; then
+    led "$KEY" error; NOTES+="$NAME: could not enter the checkout; the check did not start; not verified. "
+    /bin/rm -f "$LOG" "$LIST" "$NOSTART"; LOG=""; LIST=""; continue
+  fi
   if (( TRC == 0 )); then VERDICT=pass
   elif (( TRC == 124 )); then VERDICT=timeout
   elif (( TRC == 126 || TRC == 127 || TRC > 128 )); then VERDICT=error
@@ -277,8 +337,10 @@ for ROOT in "${UROOTS[@]}"; do
       # record the block under the lock, re-judging inside it (concurrent callbacks)
       DEC=none
       if lock_acquire; then
-        if grep -qxF "$FP" "$BF" 2>/dev/null; then DEC=repeat
-        elif (( $(bf_count) >= MAX_BLOCKS )); then DEC=capped
+        NB="$(bf_count)" || NB=""
+        if [[ -z "$NB" ]]; then DEC=unreadable
+        elif grep -qxF "$FP" "$BF" 2>/dev/null; then DEC=repeat
+        elif (( NB >= MAX_BLOCKS )); then DEC=capped
         elif printf '%s\n' "$FP" >> "$BF" 2>/dev/null && grep -qxF "$FP" "$BF" 2>/dev/null; then DEC=block
         else DEC=norecord; fi
         lock_release
@@ -291,10 +353,11 @@ for ROOT in "${UROOTS[@]}"; do
           RC=2 ;;
         repeat) led "$KEY" repeat; NOTES+="$NAME: the check failed, but another call already blocked this exact state; not blocking again; not verified. " ;;
         capped) led "$KEY" capped; NOTES+="$NAME: the check failed, but this agent was already blocked ${MAX_BLOCKS} times; not blocking; not verified. " ;;
+        unreadable) led "$KEY" error; NOTES+="$NAME: the check failed, but the block count could not be read reliably; not blocking; not verified. " ;;
         *) led "$KEY" error; NOTES+="$NAME: the check failed, but the block record could not be written or locked; not blocking, to avoid a stuck agent; not verified. " ;;
       esac ;;
   esac
-  /bin/rm -f "$LOG"
+  /bin/rm -f "$LOG" "$LIST" "$NOSTART"; LOG=""; LIST=""
 done
 
 if (( RC == 2 )); then
