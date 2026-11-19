@@ -21,14 +21,15 @@ Lauren Tan's inverted pyramid, cheapest and most trusted first:
 2. **Is it irreversible?**
    - Never allowed → deny rules plus the OS sandbox. Run Codex only through `tools/codex-dispatch.sh` (no full access, network off by default). Do not put agent launchers (`codex *`, `gemini *`), `osascript *` or `docker *` in `sandbox.excludedCommands`: an excluded command runs outside the sandbox, and exclusion is not a security boundary.
    - Allowed only under a condition (migrate only after a fresh backup) → a script with a precondition that refuses otherwise.
-3. **Can a machine tell right from wrong?** Walk the pyramid as a correction tree (our arrangement of Lauren Tan's pyramid) and stop at the first rung that works:
-   1. Redesign so the mistake cannot exist (ban the API, add a folder boundary, an import ban, a file-name convention such as `*.hot.ts` for code that runs every tick).
+3. **Can a machine tell right from wrong?** Walk the pyramid as a correction tree (our arrangement of Lauren Tan's pyramid) and stop at the first rung that works. Write one line on why the rung above could not. Design for the next agent: it sees only the files it opens, copies the nearest example, and takes the shortest path that compiles.
+   1. Redesign so the mistake cannot exist (ban the API, add a folder boundary, an import ban, a file-name convention such as `*.hot.ts` for code that runs every tick). Give each piece of state one owner, replace hand-synced lists with a single source, and delete old patterns and dead code that agents would copy.
    2. A type.
-   3. A lint rule whose error message names the fix. In the same change, remove the old pattern everywhere.
-   4. A test. Test outcomes and invariants, not how the code looks.
+   3. A lint rule whose error message names the fix. Few old instances → remove them in the same change. Many → the rule blocks only new ones, and a separate change cleans the old (§3: prevent new mistakes first).
+   4. A test. Test outcomes and invariants, not how the code looks. An existing test that passes when the behaviour is broken, or fails on an internal-only change, gets a separate test-only change that fixes or deletes it.
    5. A step in the feature map that drives the real app.
-   Prove each new check: put a real past mistake back, see the check fail, remove it, see it pass. Run it alone twice and time it; a killed run must not leave files in the repo.
+   Prove each new check: put a real past mistake back, see the check fail, remove it, see it pass. Local runs and CI run the same command. Run it alone twice and time it; a killed run must not leave files in the repo.
    - **State and timing bugs** (several devices, rooms, reconnects, schedules, payments): ordinary tests miss interleavings. Model the flow in TLA+, lock the key property in as a repo check, and draw it as a statechart for the human. Pure algorithms with invariants (scoring, sorting): consider a Lean proof. Start with one flow per project. Keep the model in sync with the code or delete it.
+   - **A text rule already existed and the mistake happened anyway** → count it as a repeat. Fix it one rung higher in the same change; the text rule did not hold.
    - **Taste** (too wordy, looks generated) → `DESIGN.md` plus screenshots, video or audio for the human.
 4. **Is it just how to do a task?** → a skill or a script. Project rules go in the repo, where every agent can read them.
 

@@ -53,6 +53,7 @@ Pick the mode from the conversation without asking: a multi-step task is startin
 2. Prove the new check: it fails on the real past mistake and passes without it. Attach both outputs.
 3. List any old text rule this replaces as "can delete", for the user to approve.
 4. Many findings at once (one review round): P1/P2, and any kind already in the ledger before this round, get steps 1–3 each. For the rest answer only METHOD §1 question 3 in one line: a machine can tell → build the check by the correction tree (several may share one task); it cannot → the ledger row is enough. Each finding gets one ledger row.
+5. Monthly, you may also look for mistakes yourself: recent commits, reverts, review comments, and comments that explain a workaround. A kind counts only once it shows up twice; then handle it as step 4 says.
 
 ## done — before handing over
 Tier first. Text tier does two things and skips steps 1–8: run the project's existing automatic checks (tests, lint, link check, whatever exists) until green and look at the changed content or its rendering; say what changed in one sentence.
