@@ -278,7 +278,7 @@ fingerprint() {  # root -> sets FPRES to a hash; fails (FPRES empty) if any step
   local r="$1" rc
   FPRES=""; : > "$FPD"; : > "$FPU"; : > "$FPF"
   (
-    printf '%s\0' "$r"
+    printf '%s\0' "$r" 'bash -o pipefail' "$VERIFY" "$LIMIT"
     git -C "$r" rev-parse -q --verify HEAD || exit 1                       # no commit yet -> not verified
     git -C "$r" -c core.fsmonitor=false diff --no-ext-diff --no-textconv HEAD >"$FPD" 2>/dev/null || exit 1
     "$HASH" < "$FPD" || exit 1
@@ -321,6 +321,9 @@ for ROOT in "${UROOTS[@]}"; do
   fingerprint "$ROOT"; FP="$FPRES"
   if [[ ${#FP} != 40 ]]; then led "$KEY" error; NOTES+="$NAME: could not list or hash the changes (a repo with no commit, or an unreadable file); not verified. "; continue; fi
   if (( ! PRE )) && grep -qxF "$FP" "$HF" 2>/dev/null; then
+    if grep -qxF "$FP" "$BF" 2>/dev/null; then
+      NOTES+="$NAME: the hand-back check failed for this state; not verified. "
+    fi
     led "$KEY" handback-done; continue   # the hand-back path already judged this exact state
   fi
   if grep -qxF "$FP" "$BF" 2>/dev/null; then
@@ -349,7 +352,7 @@ for ROOT in "${UROOTS[@]}"; do
   # either failed, the verifier never ran and its status says nothing about the project.
   { ( cd "$ROOT" 2>/dev/null && [[ "$(pwd -P)" == "$ROOT" ]] || exit 1
       : > "$STARTED" || exit 1
-      VERIFY_CHANGED_FILE="$LIST" run_limited "$LEFT" bash -c "$VERIFY" ) </dev/null >"$LOG" 2>&1; } 2>/dev/null
+      VERIFY_CHANGED_FILE="$LIST" run_limited "$LEFT" bash -o pipefail -c "$VERIFY" ) </dev/null >"$LOG" 2>&1; } 2>/dev/null
   TRC=$?
   EL=$((SECONDS - T0))
   if [[ ! -e "$STARTED" ]]; then

@@ -121,7 +121,7 @@ trap '/bin/rm -f "$OUT"' EXIT
 export NPM_CONFIG_UPDATE_NOTIFIER=false NO_COLOR=1
 # Run from the directory that was verified above, and say so if that is no longer true.
 ( cd "$ROOT" 2>/dev/null && [[ "$(pwd -P)" == "$ROOT" ]] ) || soft error "Cannot enter the checkout"
-( cd "$ROOT" && EDIT_FILE="$REL" run_limited "$LIMIT" bash -c "$CMD" ) </dev/null >"$OUT" 2>&1; RC=$?
+( cd "$ROOT" && EDIT_FILE="$REL" run_limited "$LIMIT" bash -o pipefail -c "$CMD" ) </dev/null >"$OUT" 2>&1; RC=$?
 [[ -f "$FILE" ]] || soft error "The file disappeared during the check"
 (( RC == 0 )) && { L pass; exit 0; }
 (( RC == 124 )) && soft timeout "The check timed out after ${LIMIT} s"
