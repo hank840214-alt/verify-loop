@@ -49,6 +49,8 @@ REALHOME="$(perl -e 'print((getpwuid($<))[7])')"
 expect_rc 65 "dispatch: HOME=elsewhere cannot unprotect the real home" env HOME="$T" bash "$D" -f "$T/task.md" -s read-only --skip-git-repo-check -C "$REALHOME"
 if [[ -d "$REALHOME/.claude" ]]; then
   expect_rc 65 "dispatch: HOME=elsewhere cannot unprotect the real ~/.claude" env HOME="$T" bash "$D" -f "$T/task.md" -s read-only --skip-git-repo-check -C "$REALHOME/.claude"
+else
+  echo "SKIP - real-home guard subdirectory does not exist"
 fi
 unset DRY_RUN
 mkdir -p "$T/bin"; cat > "$T/bin/codex" <<'FAKE'
@@ -124,7 +126,11 @@ expect_rc 0 "hook: non-code change ignored"         run_hook
 echo b >> "$P/src/a.ts"
 conf "true";   expect_rc 0 "hook: passing checks -> exit 0"   run_hook
 conf "false | tee /dev/null"
-expect_rc 2 "hook: a failed check piped to tee blocks Stop" run_hook pipe
+# Write the cache value produced by the 0.1.0 format for this exact checkout.
+state="$HOME/.claude/state/stop-verify"; mkdir -p "$state"
+old_pass="$(cd "$PR" && { git rev-parse HEAD; printf '%s\n' 'false | tee /dev/null' 120; printf 'file src/a.ts\0'; shasum -- src/a.ts; } | shasum | cut -c1-40)"
+printf '%s\n' "$old_pass" > "$state/$(printf '%s' "$PR" | shasum | cut -c1-16).pass"
+expect_rc 2 "hook: a failed check piped to tee blocks Stop even with a matching 0.1.0 pass" run_hook pipe
 conf "exit 1"; expect_rc 2 "hook: failing checks -> exit 2"   run_hook
 conf "exit 1"; expect_rc 2 "hook: block 1"                    run_hook s2
                expect_rc 0 "hook: same state, same session -> released" run_hook s2
@@ -663,7 +669,7 @@ setmain OK2; stp bo1; [[ "$(runs)" == 2 ]] && ok "L2 both: state changed after h
 sconf "$GOODCHK"; setmain BAD; TA="$(agent bo2)"; tr_edit "$TA" "$SR/src/main.txt"
 pre bo2 SubagentHandback; lrc "L2 both: hand-back, failing -> 2" 2
 stp bo2; lrc "L2 both: SubagentStop same failing state -> 0" 0; [[ "$(lastled "$SL" 4)" == handback-done && "$(runs)" == 1 ]] && ok "L2 both: ... no second run after a block" || bad "L2 both: block then stop ($(runs) runs)"
-has "L2 both: stop reports the previous hand-back failure" "$OUT" "not verified"
+has "L2 both: stop reports the previous hand-back failure" "$OUT" "hand-back check failed"
 # block record cannot be written -> exit 0
 mkdir -p "$HOME/.claude/state/subagent-verify/sPre.f1.blocked"; TA="$(agent f1)"; tr_edit "$TA" "$SR/src/main.txt"; pre f1 SubagentHandback
 lrc "L2: block record not writable -> 0 (never an unrecorded block)" 0; has "L2: ... says so" "$OUT" "cannot be read"
@@ -807,7 +813,10 @@ mkdir -p "$LR/node_modules"; lpost "$LR/src/a.ts"; lrc "R12: ... with requires p
 sconf "$GOODCHK"; SD2="$HOME/.claude/state/subagent-verify"; mkdir -p "$SD2/sub"
 age() { perl -e 'my $t = time - $ARGV[1] * 86400; utime $t, $t, $ARGV[0]' "$1" "$2"; }
 for f in sOld.aOld.blocked sMid.aMid.blocked old.blocked sub/sX.aX.blocked; do echo x > "$SD2/$f"; done; age "$SD2/sOld.aOld.blocked" 31; age "$SD2/sMid.aMid.blocked" 10; age "$SD2/old.blocked" 40; age "$SD2/sub/sX.aX.blocked" 40
+for f in sOld.aOld.handback sMid.aMid.handback old.handback sub/sX.aX.handback; do touch "$SD2/$f"; age "$SD2/$f" 31; done
+age "$SD2/sMid.aMid.handback" 10
 TA="$(agent p3)"; tr_edit "$TA" "$SR/src/main.txt"; pre p3 SubagentHandback
+[[ ! -e "$SD2/sOld.aOld.handback" && -e "$SD2/sMid.aMid.handback" && -e "$SD2/old.handback" && -e "$SD2/sub/sX.aX.handback" ]] && ok "L2: only expired hand-back snapshots in the state directory are pruned" || bad "L2: snapshot pruning"
 [[ ! -e "$SD2/sOld.aOld.blocked" && -e "$SD2/sMid.aMid.blocked" && -e "$SD2/old.blocked" && -e "$SD2/sub/sX.aX.blocked" ]] && ok "R4b/P3: block records are pruned after 30 days, only own-pattern files in the state folder itself" || bad "P3: prune"
 TA="$(agent p3b)"; tr_edit "$TA" "$SR/src/main.txt"; setmain BAD
 jq -nc --arg t "$TA" --arg c "$SRP" '{session_id:"sNone",transcript_path:"/nonexistent/x.jsonl",cwd:$c,agent_id:"p3b",agent_transcript_path:$t,hook_event_name:"PreToolUse",tool_name:"SubagentHandback"}' | bash "$SV" >/dev/null 2>"$T/serr"; RC=$?
@@ -909,9 +918,35 @@ touch "$RAN.slow"; echo OK > "$SP2/src/main.txt"
 pre latest SubagentHandback; lrc "L2 latest: second hand-back permits an incomplete check" 0
 has "L2 latest: second hand-back reports the timeout" "$OUT" "not verified"
 stp latest
-[[ "$RC" == 0 && "$(runs)" == 3 && "$OUT" == *'not verified'* ]] && ok "L2 latest: stop retries the timed-out checkout and reports a second timeout" || bad "L2 latest: stop after timeout (rc=$RC runs=$(runs) output=$OUT)"
-rm "$RAN.slow"; stp latest
-[[ "$RC" == 0 && "$(runs)" == 4 && "$OUT" == *'checks passed'* ]] && ok "L2 latest: stop sees recovery after actually running the check" || bad "L2 latest: recovery (rc=$RC runs=$(runs) output=$OUT)"
-[[ "$(awk -F'\t' '$2 == "acme/p2" {print $4}' "$SL" | paste -sd, -)" == fail,pass,handback-done,handback-done ]] && ok "L2 latest: both stops skip the checkout that passed its last hand-back" || bad "L2 latest: unexpected results for the other checkout"
+[[ "$RC" == 0 && "$(runs)" == 2 && "$OUT" == *'not verified'* ]] && ok "L2 latest: stop preserves the timeout without spending another budget" || bad "L2 latest: timeout (rc=$RC runs=$(runs) output=$OUT)"
+[[ "$(awk -F'\t' '$2 == "acme/p2" {print $4}' "$SL" | paste -sd, -)" == fail,pass,handback-done ]] && ok "L2 latest: stop skips the other checkout that passed" || bad "L2 latest: unexpected results for the other checkout"
+rm "$RAN.slow"; pre latest SubagentHandback
+[[ "$RC" == 0 && "$(runs)" == 3 && "$OUT" == *'checks passed'* ]] && ok "L2 latest: a fresh hand-back verifies recovery" || bad "L2 latest: recovery"
+
+# The report is delivered only when the agent's matching tool call succeeds.
+handback_result() {
+  jq -nc --arg id "$2" '{type:"assistant",message:{content:[{type:"tool_use",id:$id,name:"SubagentHandback",input:{}}]}}' >> "$1"
+  jq -nc --arg id "$2" --argjson err "$3" '{type:"user",message:{content:[{type:"tool_result",tool_use_id:$id,is_error:$err,content:"result"}]}}' >> "$1"
+}
+sconf "$GOODCHK"; setmain OK; TA="$(agent delivered)"; tr_edit "$TA" "$SR/src/main.txt"
+pre delivered SubagentHandback; handback_result "$TA" tu1 false
+stp delivered
+[[ "$RC" == 0 && "$(runs)" == 1 && -z "$OUT$ERR" ]] && ok "L2: delivered unchanged pass skips a second check" || bad "L2: delivered pass"
+setmain BAD; stp delivered
+[[ "$RC" == 0 && "$(runs)" == 1 && "$OUT" == *'not verified'* ]] && ok "L2: shared edits after delivery cannot trigger a late block or inherit a pass" || bad "L2: changed after delivery (rc=$RC runs=$(runs))"
+tr_edit "$TA" "$SR/src/main.txt"; stp delivered
+[[ "$RC" == 2 && "$(runs)" == 2 ]] && ok "L2: new agent work after delivery is checked normally" || bad "L2: resumed agent work"
+sconf "$GOODCHK"; setmain OK; TA="$(agent refused)"; tr_edit "$TA" "$SR/src/main.txt"
+pre refused SubagentHandback; handback_result "$TA" tu1 true; setmain BAD; stp refused
+[[ "$RC" == 2 && "$(runs)" == 2 ]] && ok "L2: an unsuccessful hand-back does not certify delivery" || bad "L2: refused hand-back"
+sconf 'echo run >> "$RAN"; echo generated > coverage.out; false'
+TA="$(agent generated)"; tr_edit "$TA" "$SR/src/main.txt"
+pre generated SubagentHandback; lrc "L2: a verifier that writes coverage still blocks the initial failure" 2
+stp generated
+[[ "$RC" == 0 && "$(runs)" == 1 && "$OUT" == *'hand-back check failed'* ]] && ok "L2: verifier output does not consume a second block" || bad "L2: generated output"
+rm "$SR/coverage.out"
+sconf "$GOODCHK"; setmain BAD; TA="$(agent fallback)"; tr_edit "$TA" "$SR/src/main.txt"
+stopin fallback | jq --arg main "$MAINP" 'del(.agent_transcript_path) | .transcript_path = $main' > "$T/fallback-input"
+expect_rc 2 "L2: Stop derives the agent's own transcript when its path is omitted" bash "$SV" < "$T/fallback-input"
 
 echo; echo "$pass passed, $fail failed"; (( fail == 0 ))
