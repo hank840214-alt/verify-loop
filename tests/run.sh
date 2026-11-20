@@ -681,7 +681,28 @@ CRC="$(for k in 1 2 3 4; do cat "$T/conc.$k"; done | sort | tr '\n' ' ')"
 CV="$(awk -F'\t' '$3 == "g1" {print $4}' "$SL" | sort | uniq -c | tr -s ' ' | tr '\n' ';')"
 [[ "$CRC" == "0 0 0 2 " ]] && ok "L2: 4 concurrent calls -> exit codes exactly 0,0,0,2" || bad "L2: concurrency exit codes '$CRC'"
 [[ "$(wc -l < "$SL" | tr -d ' ')" == "$((R0 + 4))" && "$CV" == " 1 fail; 3 repeat;" ]] && ok "L2: ... four new ledger rows: one fail, three repeat" || bad "L2: concurrency ledger '$CV'"
-[[ "$(wc -l < "$HOME/.claude/state/subagent-verify/sPre.g1.blocked" | tr -d ' ')" == 1 && ! -d "$HOME/.claude/state/subagent-verify/sPre.g1.lock" ]] && ok "L2: ... one block record, lock released" || bad "L2: concurrency record/lock"
+block_file="$HOME/.claude/state/subagent-verify/sPre.g1.blocked"
+[[ "$(wc -l < "$block_file" | tr -d ' ')" == 1 ]] && ok "L2: ... only one failure recorded" || bad "L2: duplicate records ($(sort "$block_file" | uniq -c | tr '\n' ' '))"
+# Simulate a slow peer holding the record. The next callback must wait, then
+# observe the peer's decision on that same file before it can spend a block.
+held_file="$HOME/.claude/state/subagent-verify/sPre.held.blocked"
+TA="$(agent held)"; tr_edit "$TA" "$SR/src/main.txt"
+perl -MFcntl=:flock -e '
+  open my $f, "+>>", $ARGV[0] or die $!;
+  flock $f, LOCK_EX or die $!;
+  open my $ready, ">", $ARGV[1] or die $!; close $ready;
+  for (1..200) { last if -f $ARGV[2]; select undef, undef, undef, 0.05 }
+  print {$f} $ARGV[3], "\n" or die $!;
+' "$held_file" "$T/hold-ready" "$RAN.release" "$(cat "$block_file")" &
+holder=$!
+for ((k=0; k<200; k++)); do [[ -f "$T/hold-ready" ]] && break; sleep 0.05; done
+prein held SubagentHandback > "$T/held-input"
+n0="$(runs)"
+bash "$SV" < "$T/held-input" > "$T/held-output" 2>&1 & waiter=$!
+for ((k=0; k<200; k++)); do [[ "$(runs)" != "$n0" ]] && break; sleep 0.05; done
+touch "$RAN.release"; wait "$holder"; wait "$waiter"; rc=$?
+[[ "$rc" == 0 && "$(wc -l < "$held_file" | tr -d ' ')" == 1 && "$(lastled "$SL" 4)" == repeat ]] && ok "L2: a concurrent holder's recorded failure is observed under the lock" || bad "L2: overlapping block writes (rc=$rc)"
+
 [[ "$(awk -F'\t' 'NF != 5 || $1 !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ {n++} END {print n + 0}' "$SL")" == 0 ]] && ok "R3b: every ledger row is whole (5 fields, one timestamp) after the concurrent writes" || bad "R3b: damaged ledger row"
 # config gates
 rm -f "$SC"; TA="$(agent h1)"; tr_edit "$TA" "$SR/src/main.txt"; pre h1 SubagentHandback; [[ "$RC" == 0 && -z "$OUT" ]] && ok "L2: no config file -> 0, silent" || bad "L2: no config"
