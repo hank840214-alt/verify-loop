@@ -120,6 +120,8 @@ echo b >> "$P/README.md"
 expect_rc 0 "hook: non-code change ignored"         run_hook
 echo b >> "$P/src/a.ts"
 conf "true";   expect_rc 0 "hook: passing checks -> exit 0"   run_hook
+conf "false | tee /dev/null"
+expect_rc 2 "hook: a failed check piped to tee blocks Stop" run_hook pipe
 conf "exit 1"; expect_rc 2 "hook: failing checks -> exit 2"   run_hook
 conf "exit 1"; expect_rc 2 "hook: block 1"                    run_hook s2
                expect_rc 0 "hook: same state, same session -> released" run_hook s2
@@ -368,6 +370,10 @@ expect_rc 0 "evidence: one quoted string runs as a shell command" in_g -- 'true 
 [[ -f "$MARK" ]] && ok "evidence: second step of a compound command ran" || bad "evidence: compound"
 grep -qF 'true && touch "$MARK"`' "$T/out" && ok "evidence: shows the command as typed" || bad "evidence: command display"
 expect_rc 64 "evidence: --log-dir inside the tree refused" in_g --log-dir .scratch-logs -- true
+expect_rc 1 "evidence: direct check failure" in_g -- false
+expect_rc 1 "evidence: tee preserves an upstream failure" in_g -- 'false | tee /dev/null'
+grep -Fq 'Exit code: **1** (FAIL)' "$T/out" && ok "evidence: upstream failure is printed as FAIL" || bad "evidence: upstream failure verdict"
+expect_rc 0 "evidence: passing pipeline still passes" in_g -- 'printf ok | tee /dev/null'
 echo t2 > "$G/tests/b.test.ts"; git -C "$G" add -A; git -C "$G" -c user.email=t@t -c user.name=t commit -qm "add test"
 echo weaker > "$G/tests/b.test.ts"; git -C "$G" -c user.email=t@t -c user.name=t commit -qam "weaken test"
 expect_rc 0 "evidence: run with base" in_g --tests-re '^tests/' --base "$(git -C "$G" rev-list --max-parents=0 HEAD)" -- true
@@ -447,6 +453,8 @@ lconf 'echo "$EDIT_FILE(1,1): error TS2322: bad"; exit 2'
 lpost "$LR/src/a.ts"; lrc "L1: error line names the edited file -> block" 2
 has "L1: stderr names the file" "$ERR" "src/a.ts(1,1): error"; has "L1: stderr is English and short" "$ERR" "already saved"
 [[ "$(lastled "$LL" 4)" == block ]] && ok "L1: ledger block" || bad "L1: ledger block"
+lconf '{ echo "$EDIT_FILE: error"; exit 1; } | tee /dev/null'
+lpost "$LR/src/a.ts"; lrc "L1: piped diagnostic for edited file blocks" 2
 lconf 'echo "src/other.ts(1,1): error TS2322: bad"; exit 2'
 lpost "$LR/src/a.ts"; lrc "L1: errors only in other files -> pass" 0
 [[ "$(lastled "$LL" 4)" == pass ]] && ok "L1: ledger pass" || bad "L1: ledger pass"
@@ -630,6 +638,8 @@ stopin() {  # agent_id [stop_hook_active]; transcript at the agent() path, sessi
   jq -nc --arg a "$1" --arg t "$PRJ/sPre/subagents/agent-$1.jsonl" --arg c "$SRP" --argjson h "${2:-false}" '{session_id:"sPre",agent_id:$a,hook_event_name:"SubagentStop",stop_hook_active:$h,cwd:$c,agent_transcript_path:$t}'
 }
 stp() { stopin "$@" | bash "$SV" >"$T/sout" 2>"$T/serr"; RC=$?; OUT="$(cat "$T/sout")"; ERR="$(cat "$T/serr")"; }
+sconf 'false | tee /dev/null'; setmain BAD; TA="$(agent pipe)"; tr_edit "$TA" "$SR/src/main.txt"
+stp pipe; lrc "L2: piped failure blocks the subagent" 2
 # SubagentStop only: fail -> exit 2 -> fixed -> pass
 sconf "$GOODCHK"; setmain BAD; TA="$(agent st1)"; tr_edit "$TA" "$SR/src/main.txt"
 stp st1; lrc "L2 stop-only: failing check -> 2" 2; has "L2 stop-only: ... block 1/2 text" "$ERR" "block 1/2"
