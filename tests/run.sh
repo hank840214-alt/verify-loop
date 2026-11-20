@@ -936,6 +936,15 @@ setmain BAD; stp delivered
 [[ "$RC" == 0 && "$(runs)" == 1 && "$OUT" == *'not verified'* ]] && ok "L2: shared edits after delivery cannot trigger a late block or inherit a pass" || bad "L2: changed after delivery (rc=$RC runs=$(runs))"
 tr_edit "$TA" "$SR/src/main.txt"; stp delivered
 [[ "$RC" == 2 && "$(runs)" == 2 ]] && ok "L2: new agent work after delivery is checked normally" || bad "L2: resumed agent work"
+# The checkout bytes can return to their old state while the verifier's input list expands.
+sconf 'echo run >> "$RAN"; while IFS= read -r f; do grep -qx OK "$f" || exit 1; done < "$VERIFY_CHANGED_FILE"'
+setmain OK; echo pending > "$SR/src/second.txt"; TA="$(agent resumed)"; tr_edit "$TA" "$SR/src/main.txt"
+pre resumed SubagentHandback; handback_result "$TA" tu1 false
+echo editing > "$SR/src/second.txt"; tr_edit "$TA" "$SR/src/second.txt"
+echo pending > "$SR/src/second.txt"; tr_edit "$TA" "$SR/src/second.txt"
+stp resumed
+[[ "$RC" == 2 && "$(runs)" == 2 ]] && ok "L2: resumed work with identical checkout bytes verifies the expanded file list" || bad "L2: reused pass after resuming (rc=$RC runs=$(runs))"
+rm "$SR/src/second.txt"
 sconf "$GOODCHK"; setmain OK; TA="$(agent refused)"; tr_edit "$TA" "$SR/src/main.txt"
 pre refused SubagentHandback; handback_result "$TA" tu1 true; setmain BAD; stp refused
 [[ "$RC" == 2 && "$(runs)" == 2 ]] && ok "L2: an unsuccessful hand-back does not certify delivery" || bad "L2: refused hand-back"
