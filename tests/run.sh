@@ -46,7 +46,10 @@ grep -q 'repo of the current folder' "$T/out" && ok "dispatch: says why (-C not 
 DF="$T/dotfiles"; mkdir -p "$DF"; git -C "$DF" init -q; ln -s "$HOME/.claude" "$DF/claude-link"
 expect_rc 0 "dispatch: read-only -C of another repo is fine" inrepo bash "$D" -f "$T/task.md" -s read-only -C "$O2"
 REALHOME="$(perl -e 'print((getpwuid($<))[7])')"
-expect_rc 65 "dispatch: HOME=elsewhere cannot unprotect the real ~/.claude" env HOME="$T" bash "$D" -f "$T/task.md" -s read-only --skip-git-repo-check -C "$REALHOME/.claude"
+expect_rc 65 "dispatch: HOME=elsewhere cannot unprotect the real home" env HOME="$T" bash "$D" -f "$T/task.md" -s read-only --skip-git-repo-check -C "$REALHOME"
+if [[ -d "$REALHOME/.claude" ]]; then
+  expect_rc 65 "dispatch: HOME=elsewhere cannot unprotect the real ~/.claude" env HOME="$T" bash "$D" -f "$T/task.md" -s read-only --skip-git-repo-check -C "$REALHOME/.claude"
+fi
 unset DRY_RUN
 mkdir -p "$T/bin"; cat > "$T/bin/codex" <<'FAKE'
 #!/usr/bin/env bash
@@ -446,7 +449,8 @@ lconf() {  # cmd [files_re] [limit] [roots-json]
 }
 PENV=(); SENV=(); PCWD="."; SCWD="."
 lpost() {  # file [tool]
-  jq -nc --arg f "$1" --arg t "${2:-Edit}" '{tool_name:$t,tool_input:{file_path:$f}}' | ( cd "$PCWD" && env ${PENV[@]+"${PENV[@]}"} bash "$PE" ) >"$T/lout" 2>"$T/lerr"; RC=$?; OUT="$(cat "$T/lout")"; ERR="$(cat "$T/lerr")"
+  jq -nc --arg f "$1" --arg t "${2:-Edit}" '{tool_name:$t,tool_input:{file_path:$f}}' > "$T/edit-input" || { bad "L1: could not create the hook input"; return 1; }
+  ( cd "$PCWD" && env ${PENV[@]+"${PENV[@]}"} bash "$PE" ) <"$T/edit-input" >"$T/lout" 2>"$T/lerr"; RC=$?; OUT="$(cat "$T/lout")"; ERR="$(cat "$T/lerr")"
 }
 bash -n "$PE" && bash -n "$SV" && ok "layers 1+2: bash -n" || bad "layers 1+2: bash -n"
 lconf 'echo "$EDIT_FILE(1,1): error TS2322: bad"; exit 2'
@@ -542,7 +546,8 @@ prein() {  # agent_id tool_name [session_id]  (the real input has no tool_input;
   jq -nc --arg a "$1" --arg tn "$2" --arg s "${3:-sPre}" --arg c "$SRP" --arg m "$MAINP" '{session_id:$s,transcript_path:$m,cwd:$c,agent_id:$a,agent_type:"worker",hook_event_name:"PreToolUse",tool_name:$tn,tool_use_id:"tu1"} | if $a == "" then del(.agent_id) else . end'
 }
 pre() {
-  prein "$@" | ( cd "$SCWD" && env ${SENV[@]+"${SENV[@]}"} bash "$SV" ) >"$T/sout" 2>"$T/serr"; RC=$?; OUT="$(cat "$T/sout")"; ERR="$(cat "$T/serr")"
+  prein "$@" > "$T/pre-input" || { bad "L2: could not create the hook input"; return 1; }
+  ( cd "$SCWD" && env ${SENV[@]+"${SENV[@]}"} bash "$SV" ) <"$T/pre-input" >"$T/sout" 2>"$T/serr"; RC=$?; OUT="$(cat "$T/sout")"; ERR="$(cat "$T/serr")"
 }
 sconf "$GOODCHK"; setmain BAD
 TA="$(agent a1)"; tr_tool "$TA" Read '{"file_path":"/etc/hosts"}'; tr_bash "$TA" 'git log --oneline | head -3 && echo commit'
@@ -593,7 +598,7 @@ TA="$(agent b4)"; tr_bash "$TA" "echo hi > /tmp/other-file" /tmp; pre b4 Subagen
 TA="$(agent b5)"; tr_bash "$TA" "printf x > \"$SUP/src/main.txt\"" /tmp; pre b5 SubagentHandback; [[ "$(lastled "$SL" 4)" == no-change ]] && ok "L2: Bash write in an untrusted clone -> no-change" || bad "L2: untrusted bash"
 TA="$(agent b6)"; tr_bash "$TA" "python3 -c \"from pathlib import Path; Path('$SRP/src/x.txt').write_text('x')\"" /tmp; pre b6 SubagentHandback; [[ "$(lastled "$SL" 4)" == pass ]] && ok "L2: Bash .write_text on the checkout -> run" || bad "L2: write_text"
 setmain BAD
-snap() { R0="$(wc -l < "$SL" 2>/dev/null | tr -d ' ')"; R0="${R0:-0}"; N0="$(runs)"; }
+snap() { R0=0; [[ -f "$SL" ]] && R0="$(wc -l < "$SL" | tr -d ' ')"; N0="$(runs)"; }
 schk() {  # name agent verdict rc run-delta : exactly one new ledger row, for this agent, with this verdict, rc and number of checker runs
   local rows="$( [[ -f "$SL" ]] && wc -l < "$SL" | tr -d ' ' || echo 0)" ag="$(tail -1 "$SL" | cut -f3)" vd="$(tail -1 "$SL" | cut -f4)" nr="$(runs)"
   [[ "$rows" == "$((R0 + 1))" && "$ag" == "${2:0:8}" && "$vd" == "$3" && "$RC" == "$4" && "$nr" == "$((N0 + $5))" ]] && ok "$1" || bad "$1 (rows $rows/$((R0 + 1)) agent '$ag'/'${2:0:8}' verdict '$vd'/$3 rc $RC/$4 runs $nr/$((N0 + $5)))"
@@ -671,7 +676,7 @@ CV="$(awk -F'\t' '$3 == "g1" {print $4}' "$SL" | sort | uniq -c | tr -s ' ' | tr
 [[ "$CRC" == "0 0 0 2 " ]] && ok "L2: 4 concurrent calls -> exit codes exactly 0,0,0,2" || bad "L2: concurrency exit codes '$CRC'"
 [[ "$(wc -l < "$SL" | tr -d ' ')" == "$((R0 + 4))" && "$CV" == " 1 fail; 3 repeat;" ]] && ok "L2: ... four new ledger rows: one fail, three repeat" || bad "L2: concurrency ledger '$CV'"
 [[ "$(wc -l < "$HOME/.claude/state/subagent-verify/sPre.g1.blocked" | tr -d ' ')" == 1 && ! -d "$HOME/.claude/state/subagent-verify/sPre.g1.lock" ]] && ok "L2: ... one block record, lock released" || bad "L2: concurrency record/lock"
-[[ "$(awk -F'\t' 'NF != 5 || $1 !~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}T/ {n++} END {print n + 0}' "$SL")" == 0 ]] && ok "R3b: every ledger row is whole (5 fields, one timestamp) after the concurrent writes" || bad "R3b: damaged ledger row"
+[[ "$(awk -F'\t' 'NF != 5 || $1 !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ {n++} END {print n + 0}' "$SL")" == 0 ]] && ok "R3b: every ledger row is whole (5 fields, one timestamp) after the concurrent writes" || bad "R3b: damaged ledger row"
 # config gates
 rm -f "$SC"; TA="$(agent h1)"; tr_edit "$TA" "$SR/src/main.txt"; pre h1 SubagentHandback; [[ "$RC" == 0 && -z "$OUT" ]] && ok "L2: no config file -> 0, silent" || bad "L2: no config"
 echo '{}' > "$SC"; pre h1 SubagentHandback; [[ "$RC" == 0 && "$(lastled "$SL" 4)" == no-change ]] && ok "L2: repo not in config -> 0 (no-change)" || bad "L2: unregistered ($(tail -1 "$SL"))"
@@ -810,9 +815,10 @@ lrc "P3: agent_transcript_path on a PreToolUse input is used when present" 2
 NJ="$T/nojq"; mkdir -p "$NJ" "$T/noperl"; for b in dirname cat mktemp; do ln -sf "$(command -v $b)" "$NJ/$b"; ln -sf "$(command -v $b)" "$T/noperl/$b"; done
 ln -sf "$(command -v perl)" "$NJ/perl"; ln -sf "$(command -v jq)" "$T/noperl/jq"
 lconf 'exit 1'
-OUT="$(jq -nc --arg f "$LR/src/a.ts" '{tool_name:"Edit",tool_input:{file_path:$f}}' | env PATH="$NJ" /bin/bash "$PE" 2>&1)"; RC=$?
+jq -nc --arg f "$LR/src/a.ts" '{tool_name:"Edit",tool_input:{file_path:$f}}' > "$T/edit-input"
+OUT="$(env PATH="$NJ" /bin/bash "$PE" <"$T/edit-input" 2>&1)"; RC=$?
 [[ $RC == 0 ]] && has "P3: L1 without jq -> fixed warning, exit 0" "$OUT" "jq missing" || bad "P3: L1 no jq (rc=$RC)"
-OUT="$(jq -nc --arg f "$LR/src/a.ts" '{tool_name:"Edit",tool_input:{file_path:$f}}' | env PATH="$T/noperl" /bin/bash "$PE" 2>&1)"; has "P3: L1 without perl -> fixed warning" "$OUT" "perl missing"
+OUT="$(env PATH="$T/noperl" /bin/bash "$PE" <"$T/edit-input" 2>&1)"; has "P3: L1 without perl -> fixed warning" "$OUT" "perl missing"
 OUT="$(prein p3 SubagentHandback | env PATH="$NJ" /bin/bash "$SV" 2>&1)"; has "P3: L2 without jq -> fixed warning" "$OUT" "jq missing"
 OUT="$(prein p3 SubagentHandback | env PATH="$T/noperl" /bin/bash "$SV" 2>&1)"; has "P3: L2 without perl -> fixed warning" "$OUT" "perl missing"
 OUT="$(prein p3 Bash | env PATH="$NJ" /bin/bash "$SV" 2>&1)"; [[ -z "$OUT" ]] && ok "P3: L2 other tool without jq stays silent" || bad "P3: L2 other tool warns: $OUT"
