@@ -8,7 +8,7 @@
 #
 # Usage (from inside the repo):
 #   verify-evidence.sh [--tests-re <regex>] [--base <ref>] [--log-dir <dir>] [--tail N] [--tool <name>]... -- <command> [args...]
-#   verify-evidence.sh ... -- 'npx tsc --noEmit && npm test'   # one quoted string runs in bash -c
+#   verify-evidence.sh ... -- 'npx tsc --noEmit && npm test'   # one quoted string runs with Bash pipefail
 # The block prints log text only with --tail N. Tool paths mask the home folder,
 # other users' folders under /Users or /home, and names under /Volumes.
 # Tool versions show only the first version token on the probe's first line, or ?.
@@ -121,7 +121,12 @@ if ((!found_tool && ${#tool_names[@]} == 2)); then
 fi
 
 start=$SECONDS
-if (($# == 1)); then bash -c "$1" >"$log" 2>&1; rc=$?; else "$@" >"$log" 2>&1; rc=$?; fi
+if (($# == 1)); then
+  bash -o pipefail -c "$1" >"$log" 2>&1
+else
+  "$@" >"$log" 2>&1
+fi
+rc=$?
 secs=$((SECONDS - start))
 hash="$(sha256 "$log")"; [[ ${#hash} == 64 ]] || die "could not hash the log" 3
 valid=1

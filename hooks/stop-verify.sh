@@ -171,7 +171,8 @@ verify_root() {
   }
   fingerprint() {  # sets PFP and RFP from CODE, TESTF, OTHER; returns 1 when the time budget is spent
     (( DEADLINE - SECONDS - 60 >= 1 )) || return 1
-    PFP="$( { git rev-parse HEAD 2>/dev/null; printf '%s\n%s\n' "$VERIFY" "$LIMIT"; fp_part ${CODE[@]+"${CODE[@]}"} ${TESTF[@]+"${TESTF[@]}"}; } | hsum | cut -c1-40)"
+    # A pass cached by a shell without pipefail cannot certify this run.
+    PFP="$( { git rev-parse HEAD 2>/dev/null; printf 'bash -o pipefail\n%s\n%s\n' "$VERIFY" "$LIMIT"; fp_part ${CODE[@]+"${CODE[@]}"} ${TESTF[@]+"${TESTF[@]}"}; } | hsum | cut -c1-40)"
     (( DEADLINE - SECONDS - 60 >= 1 )) || return 1
     RFP="$( { printf '%s\n' "$PFP"; fp_part ${OTHER[@]+"${OTHER[@]}"}; } | hsum | cut -c1-40)"
   }
@@ -252,7 +253,7 @@ verify_root() {
     LIST="$(mktemp "${TMPDIR:-/tmp}/stop-verify-list.XXXXXX")" || note "mktemp failed; verification skipped"
     printf '%s\n' "${CODE[@]}" > "$LIST"
     START=$SECONDS
-    VERIFY_CHANGED_FILE="$LIST" run_limited "$LIMIT" bash -c "$VERIFY" >"$LOG" 2>&1
+    VERIFY_CHANGED_FILE="$LIST" run_limited "$LIMIT" bash -o pipefail -c "$VERIFY" >"$LOG" 2>&1
     RC=$?
     SECS=$((SECONDS - START)); /bin/rm -f "$LIST"
     if (( RC == 0 )); then

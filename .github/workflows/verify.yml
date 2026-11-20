@@ -1,0 +1,30 @@
+name: Verification
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            check: verify-loop tests
+          - os: macos-latest
+            check: verify-loop tests (macOS)
+    name: ${{ matrix.check }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Create the empty Claude directory used by the real-home guard test
+        run: mkdir -p "$HOME/.claude"
+      - run: bash tests/run.sh

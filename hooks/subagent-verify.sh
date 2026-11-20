@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 # subagent-verify.sh — layer 2: check a subagent's work before it hands in its report.
 #
-# Input: PreToolUse with tool_name SubagentHandback. That is the tool a subagent calls to hand
-#   in its report (observed on recent Claude Code). exit 2 blocks the hand-back and stderr goes
-#   to the subagent, which keeps working. Any other PreToolUse call exits 0 at once. On a host
-#   without that tool this hook never fires. A SubagentStop input is also understood (exit 2 keeps
-#   the subagent running), but the plugin does not register that event.
+# Input, two events, both registered by the plugin:
+#   PreToolUse with tool_name SubagentHandback: the tool a subagent calls to hand in its report.
+#     exit 2 blocks the hand-back and stderr goes to the subagent, which keeps working. Any other
+#     PreToolUse call exits 0 at once.
+#   SubagentStop: for hosts without that tool (Claude Code 2.1.329 sessions were seen without it).
+#     exit 2 keeps the subagent running. On a host that has the tool, SubagentStop arrives after
+#     the report is in, so exit 2 there is useless; hence the dedupe below.
+# Dedupe: each hand-back starts a fresh snapshot. Stop skips checkouts whose fingerprint the
+#   latest hand-back checked. An unfinished check stays unverified. A delivered report cannot
+#   be recalled at stop. Later changes to the shared checkout are reported as unverified.
+#   On a SubagentStop-only host nothing writes that record, so every check runs as before.
+#   Loop guard: the cap of 2 blocks per agent (and once per fingerprint) bounds SubagentStop too,
+#   whatever stop_hook_active says; no second mechanism.
 #
 # What counts as "the subagent changed something", read from the subagent's OWN transcript:
 #   (a) a file written by Edit / Write / MultiEdit / NotebookEdit whose tool result was not an error;
@@ -39,7 +47,7 @@
 # Test-only overrides SUBVERIFY_STATE and SUBVERIFY_TOTAL are ignored when this script lives under
 # ~/.claude. They never touch trust: trust is only "roots".
 # Ledger: ~/.claude/state/subagent-verify/ledger.tsv  (time, project, agent, result, seconds)
-#   result: pass | fail | timeout | error | repeat | capped | no-change | no-transcript | skip
+#   result: pass | fail | timeout | error | repeat | capped | no-change | no-transcript | skip | handback-done
 set -uo pipefail
 START=$SECONDS
 SELF="${BASH_SOURCE[0]}"
@@ -91,11 +99,10 @@ fi
 
 # ---------- inner ----------
 START=$SECONDS
-LOG=""; LIST=""; STARTED=""; SDIR=""; XF1=""; XF2=""; FPD=""; FPU=""; FPF=""; LOCKHELD=0; LOCKD=""
+LOG=""; LIST=""; STARTED=""; SDIR=""; XF1=""; XF2=""; FPD=""; FPU=""; FPF=""; HF_TMP=""
 cleanup() {
-  /bin/rm -f "$LOG" "$LIST" "$XF1" "$XF2" "$FPD" "$FPU" "$FPF" 2>/dev/null
+  /bin/rm -f "$LOG" "$LIST" "$XF1" "$XF2" "$FPD" "$FPU" "$FPF" "$HF_TMP" 2>/dev/null
   [[ -n "$SDIR" ]] && /bin/rm -rf "$SDIR" 2>/dev/null
-  (( LOCKHELD )) && [[ -n "$LOCKD" ]] && rmdir "$LOCKD" 2>/dev/null
   return 0
 }
 trap cleanup EXIT
@@ -116,15 +123,34 @@ if [[ "$EVENT" != SubagentStop ]]; then
   # dirname(transcript_path)/<session_id>/subagents/agent-<agent_id>.jsonl
   [[ "$TOOLN" == SubagentHandback ]] || exit 0
   PRE=1
+fi
+if [[ -z "$T" ]]; then
   MT="$(j '.transcript_path // empty')"; MT="${MT/#\~/$HOME}"; RAWS="$(j '.session_id // empty')"
-  if [[ -z "$T" && -n "$MT" && -n "$RAWS" && -n "$AGENT" ]]; then T="$(dirname "$MT")/$RAWS/subagents/agent-$AGENT.jsonl"; fi
+  if [[ "$MT" == /* && "$RAWS" =~ ^[A-Za-z0-9_-]+$ && "$AGENT" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    T="$(dirname "$MT")/$RAWS/subagents/agent-$AGENT.jsonl"
+  fi
 fi
 [[ -n "$AGENT" ]] || AGENT="$(basename "${T:-noagent}" .jsonl)"
 AGENT="${AGENT//[^A-Za-z0-9_-]/_}"
 
 (umask 077; mkdir -p "$STATE_DIR") 2>/dev/null || { msg "Cannot create the state folder; not verified."; exit 0; }
+HF="$STATE_DIR/$SESSION.$AGENT.handback"
+RECORD_HANDBACK=0
+NOTES=""
+if (( PRE )); then
+  # Publish an empty snapshot before reading the transcript. An overlapping older callback
+  # keeps its own file descriptor, so its later verdicts cannot enter the new snapshot.
+  if HF_TMP="$(mktemp "$HF.XXXXXX")" && { exec 3>"$HF_TMP"; } && [[ ! -d "$HF" ]] && mv -f "$HF_TMP" "$HF"; then
+    HF_TMP=""; RECORD_HANDBACK=1
+    CALL_ID="$(j '.tool_use_id // empty')"
+    [[ "$CALL_ID" =~ ^[A-Za-z0-9_:-]+$ ]] && printf 'call %s\n' "$CALL_ID" >&3
+  else
+    /bin/rm -f "$HF" 2>/dev/null || { : > "$HF"; } 2>/dev/null
+    NOTES+="Could not refresh the hand-back record. "
+  fi
+fi
 # prune only this hook's own block records (<session>.<agent>.blocked, this folder only), after 30 days
-find "$STATE_DIR" -maxdepth 1 -type f -name '[A-Za-z0-9_-]*.[A-Za-z0-9_-]*.blocked' -mtime +30 -delete 2>/dev/null
+find "$STATE_DIR" -maxdepth 1 -type f \( -name '[A-Za-z0-9_-]*.[A-Za-z0-9_-]*.blocked' -o -name '[A-Za-z0-9_-]*.[A-Za-z0-9_-]*.handback' \) -mtime +30 -delete 2>/dev/null
 [[ -n "$HASH" ]] || { led "-" error; msg "shasum/sha1sum missing; not verified."; exit 0; }
 # No fallback to the main session transcript: it would blame the subagent for the parent's edits.
 if [[ -z "$T" || ! -f "$T" ]]; then
@@ -132,8 +158,34 @@ if [[ -z "$T" || ! -f "$T" ]]; then
   msg "Cannot read the subagent's transcript; not verified."
   exit 0
 fi
-if ! jq -n '[inputs]|length' "$T" >/dev/null 2>&1; then
+# Only a successful tool result in this agent's transcript confirms delivery. A later
+# tool call starts new work and invalidates the receipt. A PreToolUse allow is not delivery.
+DELIVERED=""
+if (( PRE )); then
+  TRANSCRIPT_QUERY='reduce inputs as $row (0; .)'
+else
+  TRANSCRIPT_QUERY='
+    reduce (inputs | . as $row | .message.content? | arrays | .[] | objects | [$row.type, .]) as [$role, $c]
+      ({id:null, delivered:false, resumed:false};
+       if $role == "assistant" and $c.type == "tool_use" then
+         if $c.name == "SubagentHandback" then {id:$c.id, delivered:false, resumed:false}
+         else .resumed = (.id != null) end
+       elif $role == "user" and $c.type == "tool_result" and .id != null and $c.tool_use_id == .id then
+         .delivered = (($c.is_error // false) == false)
+       else . end)
+    | select(.id | strings | test("^[A-Za-z0-9_:-]+$"))
+    | if .resumed then "resumed " + .id elif .delivered then "delivered " + .id else empty end'
+fi
+if ! RESULT="$(jq -nr "$TRANSCRIPT_QUERY" "$T" 2>/dev/null)"; then
   led "-" error; msg "The subagent's transcript could not be parsed; not verified."; exit 0
+fi
+SNAPSHOT=""
+if (( ! PRE )); then
+  if [[ "$RESULT" == "delivered "* ]]; then DELIVERED="${RESULT#delivered }"; fi
+  if [[ -f "$HF" && -w "$STATE_DIR" ]]; then SNAPSHOT="$(cat "$HF" 2>/dev/null)" || SNAPSHOT=""; fi
+  # A receipt from a different attempt cannot authenticate these results.
+  if [[ "$RESULT" == "resumed "* ]] && grep -qxF "call ${RESULT#resumed }" <<< "$SNAPSHOT"; then SNAPSHOT=""; fi
+  if [[ -n "$DELIVERED" ]] && ! grep -qxF "call $DELIVERED" <<< "$SNAPSHOT"; then SNAPSHOT=""; fi
 fi
 
 # --- 1. what the subagent changed, from its own transcript ---
@@ -177,7 +229,6 @@ fi
 PLIST=(); while IFS= read -r -d '' f; do PLIST+=("$f"); done < "$XF1"
 BASHL=(); while IFS= read -r -d '' f; do BASHL+=("$f"); done < "$XF2"
 
-NOTES=""
 UROOTS=(); UKEYS=(); EF=(); ER=()   # EF/ER: validated edited files and their checkout
 add_root() { local u; for u in ${UROOTS[@]+"${UROOTS[@]}"}; do [[ "$u" == "$1" ]] && return; done; UROOTS+=("$1"); UKEYS+=("$2"); }
 
@@ -246,30 +297,57 @@ if (( ${#UROOTS[@]} == 0 )); then
 fi
 
 # --- 2. per checkout: guard, fingerprint, run the check ---
-LOCKD="$STATE_DIR/$SESSION.$AGENT.lock"
 BF="$STATE_DIR/$SESSION.$AGENT.blocked"
-sleep_s() { perl -e 'select(undef,undef,undef,$ARGV[0])' "$1"; }
-lock_acquire() {
-  local n=0
-  while (( n < 100 )); do
-    if mkdir "$LOCKD" 2>/dev/null; then LOCKHELD=1; return 0; fi
-    if [[ -n "$(find "$LOCKD" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then rmdir "$LOCKD" 2>/dev/null; fi
-    sleep_s 0.1; n=$((n + 1))
-  done
-  return 1
+# Hold the kernel lock on the same descriptor used to read and append. Process exit
+# releases it, including a watchdog kill. No timestamp-based lock removal is needed.
+record_block() {
+  perl -MFcntl=:DEFAULT,:flock -e '
+    sub result { print $_[0]; exit 0 }
+    my ($path, $fp, $limit) = @ARGV;
+    sysopen(my $record, $path, O_RDWR | O_APPEND | O_CREAT, 0600) or result("norecord");
+    -f $record or result("unreadable");
+    $SIG{ALRM} = sub { result("busy") };
+    alarm 10;
+    flock($record, LOCK_EX) or result("busy");
+    alarm 0;
+    seek($record, 0, 0) or result("unreadable");
+    my $count = 0;
+    while (my $line = <$record>) {
+      result("unreadable") unless chomp $line;
+      result("repeat") if $line eq $fp;
+      ++$count;
+    }
+    eof($record) or result("unreadable");
+    result("capped") if $count >= $limit;
+    my $line = "$fp\n";
+    my $written = syswrite($record, $line);
+    result("norecord") unless defined $written && $written == length($line);
+    close($record) or result("norecord");
+    result("block");
+  ' "$BF" "$FP" "$MAX_BLOCKS"
 }
-lock_release() { rmdir "$LOCKD" 2>/dev/null; LOCKHELD=0; }
 bf_count() {  # prints the number of blocks recorded; fails if the record exists but cannot be read
   local n=0
   if [[ -e "$BF" ]]; then n="$(wc -l 2>/dev/null < "$BF")" || return 1; n="${n//[[:space:]]/}"; fi
   [[ "$n" =~ ^[0-9]+$ ]] || return 1
   printf '%s' "$n"
 }
+write_changed_files() {
+  local i pf
+  for ((i=0; i<${#EF[@]}; i++)); do
+    pf="${EF[$i]}"
+    if [[ "${ER[$i]}" == "$1" && -f "$pf" && ! -L "$pf" ]]; then
+      printf '%s\n' "${pf#"$1"/}" || return 1
+    fi
+  done
+  return 0
+}
 fingerprint() {  # root -> sets FPRES to a hash; fails (FPRES empty) if any step cannot be listed or hashed
   local r="$1" rc
   FPRES=""; : > "$FPD"; : > "$FPU"; : > "$FPF"
   (
-    printf '%s\0' "$r"
+    printf '%s\0' "$r" 'bash -o pipefail' "$VERIFY" "$LIMIT"
+    "$HASH" < "$LIST" || exit 1    # the verifier receives this exact list as VERIFY_CHANGED_FILE
     git -C "$r" rev-parse -q --verify HEAD || exit 1                       # no commit yet -> not verified
     git -C "$r" -c core.fsmonitor=false diff --no-ext-diff --no-textconv HEAD >"$FPD" 2>/dev/null || exit 1
     "$HASH" < "$FPD" || exit 1
@@ -309,8 +387,22 @@ for ROOT in "${UROOTS[@]}"; do
   fi
   if [[ -n "$REQ" && ! -e "$ROOT/$REQ" ]]; then led "$KEY" skip; NOTES+="$NAME: $REQ is missing; not verified. "; continue; fi
 
+  LIST="$SDIR/changed-files"
+  if ! write_changed_files "$ROOT" > "$LIST"; then led "$KEY" error; NOTES+="$NAME: could not list edited files; not verified. "; continue; fi
   fingerprint "$ROOT"; FP="$FPRES"
   if [[ ${#FP} != 40 ]]; then led "$KEY" error; NOTES+="$NAME: could not list or hash the changes (a repo with no commit, or an unreadable file); not verified. "; continue; fi
+  if (( ! PRE )); then
+    if grep -qxF "failed $FP" <<< "$SNAPSHOT"; then
+      led "$KEY" handback-done; NOTES+="$NAME: the hand-back check failed; not verified. "; continue
+    fi
+    if grep -qxF "passed $FP" <<< "$SNAPSHOT"; then led "$KEY" handback-done; continue; fi
+    if grep -qxF "started $FP" <<< "$SNAPSHOT"; then
+      led "$KEY" handback-done; NOTES+="$NAME: the hand-back check did not finish with a verdict; not verified. "; continue
+    fi
+    if [[ -n "$DELIVERED" ]]; then
+      led "$KEY" handback-done; NOTES+="$NAME: the report was delivered without a verified result for this checkout state; not verified. "; continue
+    fi
+  fi
   if grep -qxF "$FP" "$BF" 2>/dev/null; then
     led "$KEY" repeat; NOTES+="$NAME: this exact state was already blocked once and is not re-run; not verified. "; continue
   fi
@@ -320,15 +412,8 @@ for ROOT in "${UROOTS[@]}"; do
   fi
 
   LOG="$(mktemp "${TMPDIR:-/tmp}/subagent-verify.XXXXXX")" || { LOG=""; led "$KEY" error; NOTES+="Cannot create a temp file; not verified. "; continue; }
-  LIST="$(mktemp "${TMPDIR:-/tmp}/subagent-verify-list.XXXXXX")" || { LIST=""; led "$KEY" error; NOTES+="Cannot create a temp file; not verified. "; continue; }
   STARTED="$SDIR/started"; /bin/rm -f "$STARTED"
-  # the list holds only files that passed validation, for this checkout
-  i=0
-  while (( i < ${#EF[@]} )); do
-    pf="${EF[$i]}"
-    if [[ "${ER[$i]}" == "$ROOT" && -f "$pf" && ! -L "$pf" ]]; then printf '%s\n' "${pf#"$ROOT"/}"; fi
-    i=$((i + 1))
-  done > "$LIST"
+  (( RECORD_HANDBACK )) && printf 'started %s\n' "$FP" >&3
   LEFT=$((BUDGET - (SECONDS - START)))   # recomputed right before the run
   if (( LEFT < 3 )); then led "$KEY" timeout; NOTES+="$NAME: out of time; not verified. "; /bin/rm -f "$LOG" "$LIST"; LOG=""; LIST=""; continue; fi
   (( LIMIT < LEFT )) && LEFT=$LIMIT
@@ -337,7 +422,7 @@ for ROOT in "${UROOTS[@]}"; do
   # either failed, the verifier never ran and its status says nothing about the project.
   { ( cd "$ROOT" 2>/dev/null && [[ "$(pwd -P)" == "$ROOT" ]] || exit 1
       : > "$STARTED" || exit 1
-      VERIFY_CHANGED_FILE="$LIST" run_limited "$LEFT" bash -c "$VERIFY" ) </dev/null >"$LOG" 2>&1; } 2>/dev/null
+      VERIFY_CHANGED_FILE="$LIST" run_limited "$LEFT" bash -o pipefail -c "$VERIFY" ) 3>&- </dev/null >"$LOG" 2>&1; } 2>/dev/null
   TRC=$?
   EL=$((SECONDS - T0))
   if [[ ! -e "$STARTED" ]]; then
@@ -349,23 +434,21 @@ for ROOT in "${UROOTS[@]}"; do
   elif (( TRC == 126 || TRC == 127 || TRC > 128 )); then VERDICT=error
   else VERDICT=fail; fi
   case "$VERDICT" in
-    pass)    led "$KEY" pass; PASS_TEXT+="$NAME: checks passed (${EL} s). " ;;
+    pass)    led "$KEY" pass; (( RECORD_HANDBACK )) && printf 'passed %s\n' "$FP" >&3; PASS_TEXT+="$NAME: checks passed (${EL} s). " ;;
     timeout) led "$KEY" timeout; NOTES+="$NAME: checks did not finish within ${LEFT} s; not verified. " ;;
     error)   led "$KEY" error; NOTES+="$NAME: the check command could not run or was killed (rc=${TRC}); not a test failure; not verified. " ;;
     fail)
-      # record the block under the lock, re-judging inside it (concurrent callbacks)
-      DEC=none
-      if lock_acquire; then
-        NB="$(bf_count)" || NB=""
-        if [[ -z "$NB" ]]; then DEC=unreadable
-        elif grep -qxF "$FP" "$BF" 2>/dev/null; then DEC=repeat
-        elif (( NB >= MAX_BLOCKS )); then DEC=capped
-        elif printf '%s\n' "$FP" >> "$BF" 2>/dev/null && grep -qxF "$FP" "$BF" 2>/dev/null; then DEC=block
-        else DEC=norecord; fi
-        lock_release
-      fi
+      DEC="$(record_block)"
       case "$DEC" in
         block)
+          if (( RECORD_HANDBACK )); then
+            printf 'failed %s\n' "$FP" >&3
+            # Coverage and other output can change the checkout during the failing run.
+            # Remember that state only as a failure notice, never as a passing result.
+            if fingerprint "$ROOT" && [[ ${#FPRES} == 40 && "$FPRES" != "$FP" ]]; then
+              printf 'failed %s\n' "$FPRES" >&3
+            fi
+          fi
           led "$KEY" fail
           FAIL_TEXT+="$(printf '[%s] the check command failed (exit %d, %d s). Last output:' "$NAME" "$TRC" "$EL")"$'\n'
           FAIL_TEXT+="$(tail -40 "$LOG" | LC_ALL=C cut -c1-300)"$'\n'

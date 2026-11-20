@@ -14,7 +14,7 @@ If you build software by talking to Claude Code, Codex or Gemini CLI, you cannot
 | `skills/debug` | Say "debug". The model routes: ordinary bug, performance, state/timing, or blast radius. |
 | `hooks/stop-verify.sh` | A Stop hook. When the agent tries to finish in a registered repo with changed code, it runs that repo's checks. A failure or a timeout blocks once per exact state (`exit 2`); the same state is not re-run, and after that Claude may stop and sees NOT VERIFIED. With `tests_re` set, it also blocks, once, a change that edits code and existing tests together; it sees uncommitted edits only (committed test edits are listed by `verify-evidence.sh` for the reviewer). Its own errors never trap the session. |
 | `hooks/post-edit-check.sh` | A PostToolUse hook (`Edit`, `Write`, `MultiEdit`), layer 1. After an edit in a registered project that has an `edit_check`, it runs that quick check (for example `tsc`) and blocks (`exit 2`) only when the check fails and a line of its output names the file Claude just edited. Errors in other files are ignored. A timeout, a missing tool or its own error never blocks. |
-| `hooks/subagent-verify.sh` | A PreToolUse hook for `SubagentHandback`, layer 2. When a subagent is about to hand in its report, it works out from the subagent's own transcript whether it changed a trusted checkout, and if so runs the project's checks. A failure blocks the hand-back (`exit 2`) and the subagent keeps fixing. At most 2 blocks per subagent, once per exact state. |
+| `hooks/subagent-verify.sh` | Layer 2, registered as a PreToolUse hook for `SubagentHandback` and as a `SubagentStop` hook. When a subagent is about to hand in its report (or, on a host without that tool, is about to stop), it works out from the subagent's own transcript whether it changed a trusted checkout, and if so runs the project's checks. A failure blocks it (`exit 2`) and the subagent keeps fixing. At most 2 blocks per subagent, once per exact state. At stop, each checkout that passed or was blocked in the latest hand-back is skipped if its state matches (ledger `handback-done`). Previous failures and unfinished checks remain visible. |
 | `tools/codex-dispatch.sh` | Runs `codex exec` with an allowlist of flags only: read-only or workspace-write, network off by default for the commands Codex runs (the prompt and images still go to the model service; the caller can pass `--net`), no user config (no MCP servers, no notify hooks), workspace-write only in the current repo (or repos you list), the report file only under `<repo>/.scratch/` or `/tmp`. |
 | `tools/verify-evidence.sh` | Runs a check and prints a Markdown evidence block tied to the commit: SHA, command, exit code, log hash, the `node` and `python3` it found on `PATH` (add more with `--tool <name>`; paths are masked, but read that line before posting), and whether existing tests changed. A test added in the branch and edited again is listed under its own heading. The script does not change `PATH`: if the tools line shows a shim or an old interpreter, fix `PATH` and rerun. Refuses a dirty tree; exits 90 (INVALID) if the tree changes during the run or test edits cannot be checked. It prints no log text unless you pass `--tail N`, but it does print the full command. Local evidence helps a reviewer; it cannot see a command that edits files and puts them back. The real gate is CI rerunning on that SHA in a clean checkout. |
 | `docs/METHOD.md` | The method in one page. |
@@ -27,6 +27,8 @@ If you build software by talking to Claude Code, Codex or Gemini CLI, you cannot
 /plugin install verify-loop@verify-loop
 ```
 The plugin registers the Stop hook and the two new hooks. They do nothing until you register a project.
+
+To upgrade an existing installation, run `claude plugin marketplace update verify-loop` and `claude plugin update verify-loop@verify-loop`, then restart Claude Code. Version 0.1.1 runs hook commands and quoted evidence commands with Bash `pipefail`, so a failed test in `test-command | tee log` propagates through the pipeline. Pass separate arguments to the evidence tool to execute a program directly. A consumer such as `head` or `grep -q` can close a pipe early and leave its producer with status 141 (SIGPIPE). For verification commands, capture the full output before inspecting it. Stop blocks a nonzero pipeline, while the edit and subagent hooks report a signal as unverified.
 
 ### Register a project for the Stop hook
 Copy `examples/stop-verify.projects.json` to `~/.claude/stop-verify.projects.json` and edit it. The key is `owner/repo` from your `origin` remote (for `git@github.com:alice/shop.git` it is `alice/shop`), so a different owner's clone with the same name never matches. `roots` is required: the absolute paths of the checkouts you trust. Any other checkout, even of the same repo, is never run.
@@ -90,9 +92,11 @@ Then deny direct `codex` calls so agents are steered to the wrapper. See `exampl
 The local test guard can be bypassed (commit first, then edit the tests). Let GitHub enforce it: copy `examples/CODEOWNERS` to `.github/CODEOWNERS` with your test paths and owner, and require a PR with Code Owner review on the default branch (administrators too). Agents must push from a separate account, because GitHub does not let an account approve its own PR. Free on public repos; private repos need a paid plan.
 
 ## Requirements
-macOS or Linux, `bash`, `jq`, `perl`, `git`, `shasum`. Codex CLI for the dispatch script. Tested with Claude Code 2.1.326 and Codex CLI 0.164.0.
+macOS or Linux, `bash`, `jq`, `perl`, `git`, `shasum`. Codex CLI for the dispatch script. Tested with Claude Code 2.1.326 and Codex CLI 0.164.0. Claude Code 2.1.329 was also exercised with a subagent that failed verification at stop, fixed the code, and passed.
 
 ## Tests
+GitHub Actions runs the suite on Ubuntu and macOS for each PR and each push to `main`. To require both before merging, select `verify-loop tests` and `verify-loop tests (macOS)` in the branch rules.
+
 ```
 bash tests/run.sh
 ```
@@ -103,7 +107,7 @@ bash tests/run.sh
 - Stops at the same time on one checkout can each run the checks and each block. A pass recorded by another session can hide this session's earlier failure of the same code.
 - The hook fires whenever a registered repo has changed code, including your own unfinished work. Claude is told to stop, not edit, when the failures are not from its session, but it may still try.
 - Layer 1 (`post-edit-check.sh`) runs after the edit. It cannot undo it; it only tells Claude. Only an output line that names the edited file blocks, so a tool that prints no paths never blocks.
-- Layer 2 (`subagent-verify.sh`) needs the `SubagentHandback` tool, the one a subagent calls to hand in its report. It was observed on recent Claude Code. On a host without it, the hook never fires and nothing is checked.
+- Layer 2 (`subagent-verify.sh`) runs at the `SubagentHandback` tool when the host has it, and otherwise at `SubagentStop`. It is registered on both. Claude Code provides the hand-back tool in auto mode for local, non-fork subagents. See the [tool reference](https://code.claude.com/docs/en/tools-reference#tools). Claude Code 2.1.329 sessions were seen without `SubagentHandback`, and `SubagentStop` worked there (fail, fix, pass). At stop, an unchanged checkout with a timed-out hand-back stays unverified. A fresh hand-back can run the check again. A successful hand-back tool result in the agent's own transcript confirms delivery. Stop reports unverified changes after delivery without rerunning the check or blocking the agent. A failed hand-back tool call leaves Stop available to verify new work. If a failing verifier writes coverage files, its resulting checkout state can only carry the earlier failure notice.
 - Layer 2 works on shared checkouts. A failure can come from another session's edit, so the block message says so and tells the subagent not to revert work that is not its own.
 - Layer 2 finds a subagent's Bash writes by matching strings (`>`, `sed -i`, `mv`, `git checkout`, and so on) and path names. It can miss a write, and it can count a harmless command. Read-only git (`status`, `log`, `diff`, `show`, `stash list`) does not count.
 - Layer 2 runs the whole `handback_verify` command, whatever file the subagent changed.
@@ -127,7 +131,7 @@ From the first real runs, on one app with a server and a browser client. The dri
 - Reproduce "the machine was busy" on purpose. Blocking the event loop inside the test process reproduced it; twenty idle-spinning CPU processes did not.
 - Produce evidence with a clean `PATH`. Two full runs showed 44 and 39 false failures from an old system interpreter and from a shim.
 - A new check can be flaky too. Keep only the one signal under test real, inject the rest, then put the old mistake back and see the check fail.
-- A flow that passes is not proof until the screenshot shows what the feature map promises. One flow passed on internal state while the thing it claimed was off screen, and later while it sat under an overlay. In that project the check now requires the visible label, uncovered, before and after the shot.
+- In a game, the helper existed in memory but could be off screen or covered by the HUD. The driver now checks visibility and movement. Removing the default helper made the flow fail. After restoring it, the flow passed ten consecutive runs.
 - Drive the build your users get. The first driver built without the production feature flags, so four flows passed on screens no user sees.
 - Tie the picture to the code. A screenshot stamped with a commit id must come from that commit. That project's driver stamps an uncommitted build `+dirty` and refuses a running instance built from another state.
 - A verification tool that starts processes must prove a process is its own before it stops it. A recorded PID is not proof after a reboot; record the start time and command line too.
@@ -137,6 +141,7 @@ From the first real runs, on one app with a server and a browser client. The dri
 From the first day of the two edit and hand-back hooks, on the same project (two small ledgers, so treat these as early signs, not results):
 
 - Unit tests are not enough for a hook; run it once in the real host. The first layer-2 version listened for the subagent's stop event and passed 212 unit tests. In real use it logged two failures and nothing was fixed: by the time the block arrived, the subagent had already handed in. Moving it to the hand-back tool call gave one full fail → fix → pass cycle.
+- A host feature can disappear between versions: the hand-back tool the hook was built on was missing in newer sessions; registering on both events kept the check working.
 - Set the time limit from runs on a busy machine. The full test suite took 133–226 s under load, against an estimated 100–130 s when idle. A first limit of 200 s meant every busy run ended as "not verified".
 - A file the checker does not cover is skipped, not passed. That project's type-check config covered only two of its folders, so edits elsewhere were skipped, not checked (the private version that ran then logged them as `skip`).
 - Most subagents change nothing. 11 of 17 layer-2 entries were read-only subagents, so the check cost them nothing.

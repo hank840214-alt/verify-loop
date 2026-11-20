@@ -27,13 +27,13 @@ Lauren Tan 的倒金字塔（便宜、可信的在前）：程式碼設計 → �
    - **口味**（字太多、像 AI）→ `DESIGN.md`＋截圖、影片、試聽。
 4. **只是某件事的做法？** → skill 或腳本。專案規則放 repo，每個 AI 都看得到。
 
-Hook：檢查失敗一定 `exit 2`（exit 1 會被當成完成）。hook 逾時＝沒檢查，所以停止 hook 自設低於 hook timeout 的總時限。失敗或沒跑完，同一個確切狀態只擋一次；之後 Claude 可以收工，並看到 NOT VERIFIED。每次判定都追加到 `~/.claude/state/stop-verify/ledger.tsv`（只在本機、不含路徑）。有子代理、workflow 或 `codex-dispatch.sh` 在跑時先不檢查，等下一次收工再跑。更早還有兩層，讀同一份專案檔：PostToolUse hook 每次改檔後跑快速檢查，檢查失敗而且輸出裡有一行點名被改的那個檔時才擋（不解析診斷格式）；`SubagentHandback` 的 PreToolUse hook 在改過受信任 checkout 的子代理交報告前，先跑專案的檢查。hook 自己壞掉（沒有 `jq`）就 exit 0 加提醒，不卡住 session。
+Hook：檢查失敗一定 `exit 2`（exit 1 會被當成完成）。hook 逾時＝沒檢查，所以停止 hook 自設低於 hook timeout 的總時限。失敗或沒跑完，同一個確切狀態只擋一次；之後 Claude 可以收工，並看到 NOT VERIFIED。每次判定都追加到 `~/.claude/state/stop-verify/ledger.tsv`（只在本機、不含路徑）。有子代理、workflow 或 `codex-dispatch.sh` 在跑時先不檢查，等下一次收工再跑。更早還有兩層，讀同一份專案檔：PostToolUse hook 每次改檔後跑快速檢查，檢查失敗而且輸出裡有一行點名被改的那個檔時才擋（不解析診斷格式）；改過受信任 checkout 的子代理會在 `SubagentHandback` 或 `SubagentStop` 事件執行專案檢查，同一份交回結果可供停止事件沿用。交報告工具回傳成功才代表報告已交付，此後的 checkout 變更會顯示為未驗證。只有 Stop 的環境仍會驗證並擋下失敗。hook 自己壞掉（沒有 `jq`）就 exit 0 加提醒，不卡住 session。
 
 ## 二、誰看什麼
 - 人只看**成品**：前後截圖、短片、狀態圖、「修前失敗、修後通過」紀錄。用功能地圖的固定名稱溝通。
 - **證據規則**：每個「做好了／通過了」都附指令＋輸出，或成品路徑。沒有證據＝沒做完。
-- **出題的不改考卷**（來自讀者留言）：同一個 agent 寫修法又寫測試，等於自己出題自己改。
-  - 會失敗的測試由「不是寫修法的那個 agent」寫，先單獨 commit。沒有工具檢查是誰寫的；審查者用 `git log` 確認測試 commit 在前、且單獨一個。
+- **回歸測試由獨立審查者驗收**（來自讀者留言）。
+  - 一般改動可由實作者新增回歸測試，獨立審查者確認同一個測試在舊行為失敗、修正後通過。高風險改動由另一個 agent 先寫會失敗的測試並單獨 commit，審查者核對提交順序。
   - 修法的改動不准改判它對錯的既有測試。停止 hook 的「測試守衛」會擋（未提交的程式和既有測試一起改 → exit 2；已提交的由證據腳本列給審查者）；新增測試檔可以。測試真的錯 → 另開只改測試的改動，由另一個 agent 或人核准。
   - 證據綁 commit：PR 的驗證段由 `tools/verify-evidence.sh` 產生（commit SHA、指令、結束碼、log 雜湊；加 `--tests-re <測試路徑>` 時列出有沒有動到既有測試），不是 agent 自己寫；審查者核對 SHA＝PR 最新 commit。
   - 合併要人或獨立審查者對同一個 SHA 放行。本機守衛防失誤、不防故意繞過；硬擋要 CI＋分支保護，並把測試資料夾列進 `CODEOWNERS`，動到測試的 PR 一定要負責人審（AI 要用另一個帳號 push）。
