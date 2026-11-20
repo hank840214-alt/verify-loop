@@ -658,6 +658,7 @@ setmain OK2; stp bo1; [[ "$(runs)" == 2 ]] && ok "L2 both: state changed after h
 sconf "$GOODCHK"; setmain BAD; TA="$(agent bo2)"; tr_edit "$TA" "$SR/src/main.txt"
 pre bo2 SubagentHandback; lrc "L2 both: hand-back, failing -> 2" 2
 stp bo2; lrc "L2 both: SubagentStop same failing state -> 0" 0; [[ "$(lastled "$SL" 4)" == handback-done && "$(runs)" == 1 ]] && ok "L2 both: ... no second run after a block" || bad "L2 both: block then stop ($(runs) runs)"
+has "L2 both: stop reports the previous hand-back failure" "$OUT" "not verified"
 # block record cannot be written -> exit 0
 mkdir -p "$HOME/.claude/state/subagent-verify/sPre.f1.blocked"; TA="$(agent f1)"; tr_edit "$TA" "$SR/src/main.txt"; pre f1 SubagentHandback
 lrc "L2: block record not writable -> 0 (never an unrecorded block)" 0; has "L2: ... says so" "$OUT" "cannot be read"
