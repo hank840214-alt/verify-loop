@@ -8,9 +8,8 @@
 #   SubagentStop: for hosts without that tool (Claude Code 2.1.329 sessions were seen without it).
 #     exit 2 keeps the subagent running. On a host that has the tool, SubagentStop arrives after
 #     the report is in, so exit 2 there is useless; hence the dedupe below.
-# Dedupe: when the PreToolUse path reached a verdict for this agent (pass, or block), it records
-#   the state fingerprint in <session>.<agent>.handback. A SubagentStop call for the same agent
-#   with the same fingerprint then exits 0 at once, ledger result "handback-done", no check run.
+# Dedupe: each hand-back starts a fresh snapshot. Stop skips checkouts whose fingerprint the
+#   latest hand-back passed or blocked. Incomplete checks remain eligible to run at stop.
 #   On a SubagentStop-only host nothing writes that record, so every check runs as before.
 #   Loop guard: the cap of 2 blocks per agent (and once per fingerprint) bounds SubagentStop too,
 #   whatever stop_hook_active says; no second mechanism.
@@ -99,9 +98,9 @@ fi
 
 # ---------- inner ----------
 START=$SECONDS
-LOG=""; LIST=""; STARTED=""; SDIR=""; XF1=""; XF2=""; FPD=""; FPU=""; FPF=""; LOCKHELD=0; LOCKD=""
+LOG=""; LIST=""; STARTED=""; SDIR=""; XF1=""; XF2=""; FPD=""; FPU=""; FPF=""; LOCKHELD=0; LOCKD=""; HF_TMP=""
 cleanup() {
-  /bin/rm -f "$LOG" "$LIST" "$XF1" "$XF2" "$FPD" "$FPU" "$FPF" 2>/dev/null
+  /bin/rm -f "$LOG" "$LIST" "$XF1" "$XF2" "$FPD" "$FPU" "$FPF" "$HF_TMP" 2>/dev/null
   [[ -n "$SDIR" ]] && /bin/rm -rf "$SDIR" 2>/dev/null
   (( LOCKHELD )) && [[ -n "$LOCKD" ]] && rmdir "$LOCKD" 2>/dev/null
   return 0
@@ -131,6 +130,19 @@ fi
 AGENT="${AGENT//[^A-Za-z0-9_-]/_}"
 
 (umask 077; mkdir -p "$STATE_DIR") 2>/dev/null || { msg "Cannot create the state folder; not verified."; exit 0; }
+HF="$STATE_DIR/$SESSION.$AGENT.handback"
+RECORD_HANDBACK=0
+NOTES=""
+if (( PRE )); then
+  # Publish an empty snapshot before reading the transcript. An overlapping older callback
+  # keeps its own file descriptor, so its later verdicts cannot enter the new snapshot.
+  if HF_TMP="$(mktemp "$HF.XXXXXX")" && { exec 3>"$HF_TMP"; } && [[ ! -d "$HF" ]] && mv -f "$HF_TMP" "$HF"; then
+    HF_TMP=""; RECORD_HANDBACK=1
+  else
+    /bin/rm -f "$HF" 2>/dev/null || { : > "$HF"; } 2>/dev/null
+    NOTES+="Could not refresh the hand-back record. "
+  fi
+fi
 # prune only this hook's own block records (<session>.<agent>.blocked, this folder only), after 30 days
 find "$STATE_DIR" -maxdepth 1 -type f \( -name '[A-Za-z0-9_-]*.[A-Za-z0-9_-]*.blocked' -o -name '[A-Za-z0-9_-]*.[A-Za-z0-9_-]*.handback' \) -mtime +30 -delete 2>/dev/null
 [[ -n "$HASH" ]] || { led "-" error; msg "shasum/sha1sum missing; not verified."; exit 0; }
@@ -185,7 +197,6 @@ fi
 PLIST=(); while IFS= read -r -d '' f; do PLIST+=("$f"); done < "$XF1"
 BASHL=(); while IFS= read -r -d '' f; do BASHL+=("$f"); done < "$XF2"
 
-NOTES=""
 UROOTS=(); UKEYS=(); EF=(); ER=()   # EF/ER: validated edited files and their checkout
 add_root() { local u; for u in ${UROOTS[@]+"${UROOTS[@]}"}; do [[ "$u" == "$1" ]] && return; done; UROOTS+=("$1"); UKEYS+=("$2"); }
 
@@ -256,7 +267,6 @@ fi
 # --- 2. per checkout: guard, fingerprint, run the check ---
 LOCKD="$STATE_DIR/$SESSION.$AGENT.lock"
 BF="$STATE_DIR/$SESSION.$AGENT.blocked"
-HF="$STATE_DIR/$SESSION.$AGENT.handback"   # fingerprints the hand-back path reached a verdict for
 sleep_s() { perl -e 'select(undef,undef,undef,$ARGV[0])' "$1"; }
 lock_acquire() {
   local n=0
@@ -320,7 +330,8 @@ for ROOT in "${UROOTS[@]}"; do
 
   fingerprint "$ROOT"; FP="$FPRES"
   if [[ ${#FP} != 40 ]]; then led "$KEY" error; NOTES+="$NAME: could not list or hash the changes (a repo with no commit, or an unreadable file); not verified. "; continue; fi
-  if (( ! PRE )) && grep -qxF "$FP" "$HF" 2>/dev/null; then
+  # Old plugin versions appended bare fingerprints across attempts. Only use fresh snapshots.
+  if (( ! PRE )) && [[ -w "$STATE_DIR" ]] && grep -qxF "current $FP" "$HF" 2>/dev/null; then
     if grep -qxF "$FP" "$BF" 2>/dev/null; then
       NOTES+="$NAME: the hand-back check failed for this state; not verified. "
     fi
@@ -352,7 +363,7 @@ for ROOT in "${UROOTS[@]}"; do
   # either failed, the verifier never ran and its status says nothing about the project.
   { ( cd "$ROOT" 2>/dev/null && [[ "$(pwd -P)" == "$ROOT" ]] || exit 1
       : > "$STARTED" || exit 1
-      VERIFY_CHANGED_FILE="$LIST" run_limited "$LEFT" bash -o pipefail -c "$VERIFY" ) </dev/null >"$LOG" 2>&1; } 2>/dev/null
+      VERIFY_CHANGED_FILE="$LIST" run_limited "$LEFT" bash -o pipefail -c "$VERIFY" ) 3>&- </dev/null >"$LOG" 2>&1; } 2>/dev/null
   TRC=$?
   EL=$((SECONDS - T0))
   if [[ ! -e "$STARTED" ]]; then
@@ -364,7 +375,7 @@ for ROOT in "${UROOTS[@]}"; do
   elif (( TRC == 126 || TRC == 127 || TRC > 128 )); then VERDICT=error
   else VERDICT=fail; fi
   case "$VERDICT" in
-    pass)    led "$KEY" pass; (( PRE )) && printf '%s\n' "$FP" >> "$HF" 2>/dev/null; PASS_TEXT+="$NAME: checks passed (${EL} s). " ;;
+    pass)    led "$KEY" pass; (( RECORD_HANDBACK )) && printf 'current %s\n' "$FP" >&3; PASS_TEXT+="$NAME: checks passed (${EL} s). " ;;
     timeout) led "$KEY" timeout; NOTES+="$NAME: checks did not finish within ${LEFT} s; not verified. " ;;
     error)   led "$KEY" error; NOTES+="$NAME: the check command could not run or was killed (rc=${TRC}); not a test failure; not verified. " ;;
     fail)
@@ -381,7 +392,7 @@ for ROOT in "${UROOTS[@]}"; do
       fi
       case "$DEC" in
         block)
-          (( PRE )) && printf '%s\n' "$FP" >> "$HF" 2>/dev/null
+          (( RECORD_HANDBACK )) && printf 'current %s\n' "$FP" >&3
           led "$KEY" fail
           FAIL_TEXT+="$(printf '[%s] the check command failed (exit %d, %d s). Last output:' "$NAME" "$TRC" "$EL")"$'\n'
           FAIL_TEXT+="$(tail -40 "$LOG" | LC_ALL=C cut -c1-300)"$'\n'
