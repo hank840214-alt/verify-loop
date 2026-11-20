@@ -99,11 +99,10 @@ fi
 
 # ---------- inner ----------
 START=$SECONDS
-LOG=""; LIST=""; STARTED=""; SDIR=""; XF1=""; XF2=""; FPD=""; FPU=""; FPF=""; LOCKHELD=0; LOCKD=""; HF_TMP=""
+LOG=""; LIST=""; STARTED=""; SDIR=""; XF1=""; XF2=""; FPD=""; FPU=""; FPF=""; HF_TMP=""
 cleanup() {
   /bin/rm -f "$LOG" "$LIST" "$XF1" "$XF2" "$FPD" "$FPU" "$FPF" "$HF_TMP" 2>/dev/null
   [[ -n "$SDIR" ]] && /bin/rm -rf "$SDIR" 2>/dev/null
-  (( LOCKHELD )) && [[ -n "$LOCKD" ]] && rmdir "$LOCKD" 2>/dev/null
   return 0
 }
 trap cleanup EXIT
@@ -298,19 +297,35 @@ if (( ${#UROOTS[@]} == 0 )); then
 fi
 
 # --- 2. per checkout: guard, fingerprint, run the check ---
-LOCKD="$STATE_DIR/$SESSION.$AGENT.lock"
 BF="$STATE_DIR/$SESSION.$AGENT.blocked"
-sleep_s() { perl -e 'select(undef,undef,undef,$ARGV[0])' "$1"; }
-lock_acquire() {
-  local n=0
-  while (( n < 100 )); do
-    if mkdir "$LOCKD" 2>/dev/null; then LOCKHELD=1; return 0; fi
-    if [[ -n "$(find "$LOCKD" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then rmdir "$LOCKD" 2>/dev/null; fi
-    sleep_s 0.1; n=$((n + 1))
-  done
-  return 1
+# Hold the kernel lock on the same descriptor used to read and append. Process exit
+# releases it, including a watchdog kill. No timestamp-based lock removal is needed.
+record_block() {
+  perl -MFcntl=:DEFAULT,:flock -e '
+    sub result { print $_[0]; exit 0 }
+    my ($path, $fp, $limit) = @ARGV;
+    sysopen(my $record, $path, O_RDWR | O_APPEND | O_CREAT, 0600) or result("norecord");
+    -f $record or result("unreadable");
+    $SIG{ALRM} = sub { result("busy") };
+    alarm 10;
+    flock($record, LOCK_EX) or result("busy");
+    alarm 0;
+    seek($record, 0, 0) or result("unreadable");
+    my $count = 0;
+    while (my $line = <$record>) {
+      result("unreadable") unless chomp $line;
+      result("repeat") if $line eq $fp;
+      ++$count;
+    }
+    eof($record) or result("unreadable");
+    result("capped") if $count >= $limit;
+    my $line = "$fp\n";
+    my $written = syswrite($record, $line);
+    result("norecord") unless defined $written && $written == length($line);
+    close($record) or result("norecord");
+    result("block");
+  ' "$BF" "$FP" "$MAX_BLOCKS"
 }
-lock_release() { rmdir "$LOCKD" 2>/dev/null; LOCKHELD=0; }
 bf_count() {  # prints the number of blocks recorded; fails if the record exists but cannot be read
   local n=0
   if [[ -e "$BF" ]]; then n="$(wc -l 2>/dev/null < "$BF")" || return 1; n="${n//[[:space:]]/}"; fi
@@ -423,17 +438,7 @@ for ROOT in "${UROOTS[@]}"; do
     timeout) led "$KEY" timeout; NOTES+="$NAME: checks did not finish within ${LEFT} s; not verified. " ;;
     error)   led "$KEY" error; NOTES+="$NAME: the check command could not run or was killed (rc=${TRC}); not a test failure; not verified. " ;;
     fail)
-      # record the block under the lock, re-judging inside it (concurrent callbacks)
-      DEC=none
-      if lock_acquire; then
-        NB="$(bf_count)" || NB=""
-        if [[ -z "$NB" ]]; then DEC=unreadable
-        elif grep -qxF "$FP" "$BF" 2>/dev/null; then DEC=repeat
-        elif (( NB >= MAX_BLOCKS )); then DEC=capped
-        elif printf '%s\n' "$FP" >> "$BF" 2>/dev/null && grep -qxF "$FP" "$BF" 2>/dev/null; then DEC=block
-        else DEC=norecord; fi
-        lock_release
-      fi
+      DEC="$(record_block)"
       case "$DEC" in
         block)
           if (( RECORD_HANDBACK )); then
