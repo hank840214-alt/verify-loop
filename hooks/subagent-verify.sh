@@ -167,22 +167,25 @@ if (( PRE )); then
 else
   TRANSCRIPT_QUERY='
     reduce (inputs | . as $row | .message.content? | arrays | .[] | objects | [$row.type, .]) as [$role, $c]
-      ({id:null, delivered:false};
+      ({id:null, delivered:false, resumed:false};
        if $role == "assistant" and $c.type == "tool_use" then
-         {id:(if $c.name == "SubagentHandback" then $c.id else null end), delivered:false}
+         if $c.name == "SubagentHandback" then {id:$c.id, delivered:false, resumed:false}
+         else .resumed = (.id != null) end
        elif $role == "user" and $c.type == "tool_result" and .id != null and $c.tool_use_id == .id then
          .delivered = (($c.is_error // false) == false)
        else . end)
-    | if .delivered then (.id | strings | select(test("^[A-Za-z0-9_:-]+$"))) else empty end'
+    | select(.id | strings | test("^[A-Za-z0-9_:-]+$"))
+    | if .resumed then "resumed " + .id elif .delivered then "delivered " + .id else empty end'
 fi
 if ! RESULT="$(jq -nr "$TRANSCRIPT_QUERY" "$T" 2>/dev/null)"; then
   led "-" error; msg "The subagent's transcript could not be parsed; not verified."; exit 0
 fi
 SNAPSHOT=""
 if (( ! PRE )); then
-  DELIVERED="$RESULT"
+  if [[ "$RESULT" == "delivered "* ]]; then DELIVERED="${RESULT#delivered }"; fi
   if [[ -f "$HF" && -w "$STATE_DIR" ]]; then SNAPSHOT="$(cat "$HF" 2>/dev/null)" || SNAPSHOT=""; fi
   # A receipt from a different attempt cannot authenticate these results.
+  if [[ "$RESULT" == "resumed "* ]] && grep -qxF "call ${RESULT#resumed }" <<< "$SNAPSHOT"; then SNAPSHOT=""; fi
   if [[ -n "$DELIVERED" ]] && ! grep -qxF "call $DELIVERED" <<< "$SNAPSHOT"; then SNAPSHOT=""; fi
 fi
 
@@ -314,11 +317,22 @@ bf_count() {  # prints the number of blocks recorded; fails if the record exists
   [[ "$n" =~ ^[0-9]+$ ]] || return 1
   printf '%s' "$n"
 }
+write_changed_files() {
+  local i pf
+  for ((i=0; i<${#EF[@]}; i++)); do
+    pf="${EF[$i]}"
+    if [[ "${ER[$i]}" == "$1" && -f "$pf" && ! -L "$pf" ]]; then
+      printf '%s\n' "${pf#"$1"/}" || return 1
+    fi
+  done
+  return 0
+}
 fingerprint() {  # root -> sets FPRES to a hash; fails (FPRES empty) if any step cannot be listed or hashed
   local r="$1" rc
   FPRES=""; : > "$FPD"; : > "$FPU"; : > "$FPF"
   (
     printf '%s\0' "$r" 'bash -o pipefail' "$VERIFY" "$LIMIT"
+    "$HASH" < "$LIST" || exit 1    # the verifier receives this exact list as VERIFY_CHANGED_FILE
     git -C "$r" rev-parse -q --verify HEAD || exit 1                       # no commit yet -> not verified
     git -C "$r" -c core.fsmonitor=false diff --no-ext-diff --no-textconv HEAD >"$FPD" 2>/dev/null || exit 1
     "$HASH" < "$FPD" || exit 1
@@ -358,6 +372,8 @@ for ROOT in "${UROOTS[@]}"; do
   fi
   if [[ -n "$REQ" && ! -e "$ROOT/$REQ" ]]; then led "$KEY" skip; NOTES+="$NAME: $REQ is missing; not verified. "; continue; fi
 
+  LIST="$SDIR/changed-files"
+  if ! write_changed_files "$ROOT" > "$LIST"; then led "$KEY" error; NOTES+="$NAME: could not list edited files; not verified. "; continue; fi
   fingerprint "$ROOT"; FP="$FPRES"
   if [[ ${#FP} != 40 ]]; then led "$KEY" error; NOTES+="$NAME: could not list or hash the changes (a repo with no commit, or an unreadable file); not verified. "; continue; fi
   if (( ! PRE )); then
@@ -381,15 +397,7 @@ for ROOT in "${UROOTS[@]}"; do
   fi
 
   LOG="$(mktemp "${TMPDIR:-/tmp}/subagent-verify.XXXXXX")" || { LOG=""; led "$KEY" error; NOTES+="Cannot create a temp file; not verified. "; continue; }
-  LIST="$(mktemp "${TMPDIR:-/tmp}/subagent-verify-list.XXXXXX")" || { LIST=""; led "$KEY" error; NOTES+="Cannot create a temp file; not verified. "; continue; }
   STARTED="$SDIR/started"; /bin/rm -f "$STARTED"
-  # the list holds only files that passed validation, for this checkout
-  i=0
-  while (( i < ${#EF[@]} )); do
-    pf="${EF[$i]}"
-    if [[ "${ER[$i]}" == "$ROOT" && -f "$pf" && ! -L "$pf" ]]; then printf '%s\n' "${pf#"$ROOT"/}"; fi
-    i=$((i + 1))
-  done > "$LIST"
   (( RECORD_HANDBACK )) && printf 'started %s\n' "$FP" >&3
   LEFT=$((BUDGET - (SECONDS - START)))   # recomputed right before the run
   if (( LEFT < 3 )); then led "$KEY" timeout; NOTES+="$NAME: out of time; not verified. "; /bin/rm -f "$LOG" "$LIST"; LOG=""; LIST=""; continue; fi

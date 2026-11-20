@@ -62,7 +62,7 @@ GitHub Actions 會在每張 PR 及每次推送至 `main` 時，於 Ubuntu 和 ma
 - 同一個 checkout 同時收工，可能各自跑檢查、各自被擋；另一個 session 記下的通過，可能蓋過這個 session 先前對同一份程式的失敗。
 - 只要登記的 repo 有改動（包括你自己沒做完的），hook 就會觸發。失敗不是這個 session 造成時，Claude 被要求說明並停手，但它仍可能去改。
 - 第 1 層（`post-edit-check.sh`）在改檔之後才跑，無法還原那次編輯，只能告訴 Claude。只有點名被改檔案的輸出行才會擋，所以不印路徑的工具永遠不會擋。
-- 第 2 層（`subagent-verify.sh`）在環境有 `SubagentHandback` 時，於那個工具呼叫處執行；沒有時改在 `SubagentStop` 執行。兩個事件都有註冊。Claude Code 2.1.329 的 session 觀察到沒有 `SubagentHandback`，而 `SubagentStop` 在那裡有效（失敗、修好、通過）。交報告時逾時，若 checkout 沒有改變，結束時會保留「未驗證」。再次交報告可重新執行檢查。子代理自己的對話紀錄裡，交報告工具成功才代表已交付。此後 checkout 有新改動，Stop 會回報未驗證，子代理可以結束。若交付工具失敗，Stop 仍可驗證後續工作。若失敗的測試產生覆蓋率檔，該狀態只沿用先前的失敗提醒。
+- 第 2 層（`subagent-verify.sh`）在環境有 `SubagentHandback` 時，於那個工具呼叫處執行；沒有時改在 `SubagentStop` 執行。兩個事件都有註冊。 Claude Code 在 auto mode 下會將交報告工具提供給本機執行、非 fork 的子代理。[官方工具說明](https://code.claude.com/docs/en/tools-reference#tools) Claude Code 2.1.329 的 session 觀察到沒有 `SubagentHandback`，而 `SubagentStop` 在那裡有效（失敗、修好、通過）。交報告時逾時，若 checkout 沒有改變，結束時會保留「未驗證」。再次交報告可重新執行檢查。子代理自己的對話紀錄裡，交報告工具成功才代表已交付。此後 checkout 有新改動，Stop 會回報未驗證，子代理可以結束。若交付工具失敗，Stop 仍可驗證後續工作。若失敗的測試產生覆蓋率檔，該狀態只沿用先前的失敗提醒。
 - 第 2 層面對的是共用的 checkout。失敗可能來自別的 session 的改動，所以擋下時的訊息會這樣說，並要求子代理不要去還原不是自己的改動。
 - 第 2 層靠字串比對（`>`、`sed -i`、`mv`、`git checkout` 等）加路徑名稱，找出子代理用 Bash 寫的檔。可能漏掉，也可能把無害的指令算進去。唯讀的 git（`status`、`log`、`diff`、`show`、`stash list`）不算寫入。
 - 第 2 層不管子代理改的是哪個檔，都會跑完整的 `handback_verify`。
