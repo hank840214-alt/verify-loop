@@ -21,6 +21,8 @@
 
 安裝：外掛會註冊停止 hook 與新的兩個 hook，專案登記前它們都什麼都不做。設定步驟請看 [README.md](README.md)（指令相同）。專案登記的 key 是 `owner/repo`，例如 `alice/shop`；另外必須填 `roots`：你信任的 checkout 絕對路徑。其他位置的 clone（就算同一個 repo）都不會被執行，hook 會提示並印出該補進 `roots` 的實際路徑。信任的 checkout 底下的 linked worktree 也算信任。選填 `skip_re`：符合的檔案不會觸發檢查（自動產生的檔案、被中斷的測試留下的資料夾）。每次判定都會追加一行到 `~/.claude/state/stop-verify/ledger.tsv`（只在本機、不印出、不含完整路徑）。有子代理、workflow 或 `codex-dispatch.sh` 在跑時會先不檢查，等下一次收工再跑。`STOP_VERIFY_DEADLINE`（120..540 秒，預設 540）是總時間上限。要強制重跑已失敗的狀態：改一個檔案，或刪掉 `<state 資料夾>/<id>.red`。`VERIFY_CHANGED_FILE` 以換行分隔，所以不支援含換行的檔名。登記前先請 AI 跑 `/verify-loop setup`，它會讀測試設定，列出會重置資料庫、部署、寄信或打付費 API 的步驟。
 
+更新既有安裝時，依序執行 `claude plugin marketplace update verify-loop`、`claude plugin update verify-loop@verify-loop`，再重新啟動 Claude Code。0.1.1 的 hook 指令與證據工具的單一字串指令會啟用 Bash `pipefail`，因此 `test-command | tee log` 會保留測試失敗的結束碼。
+
 ### 每次改檔後的快速檢查，與子代理交報告前的檢查
 
 兩個 hook 讀同一份專案檔、用同樣的 `roots` 信任方式。它們是選擇加入的：專案沒填 `edit_check`，第 1 層就不碰它；沒填 `handback_verify`，第 2 層就不碰它（不會拿停止 hook 的 `verify` 來跑）。兩個 hook 都以你的身分、在 Claude Code 沙盒外執行你的指令，而且時機是停止 hook 沒有的：第 1 層在每次符合的改檔後，第 2 層在改過 checkout 的子代理交報告時。這兩個 hook 只有在 `$STOP_VERIFY_CONFIG` 是指向一般檔案（不是連結）的絕對路徑，而且位於 `~/.claude` 或 `~/.config` 底下時才採用；否則用 `~/.claude/stop-verify.projects.json`。停止 hook 仍接受任何絕對路徑。
@@ -46,6 +48,8 @@
 - `handback_limit`：這次執行的秒數上限，超過算「沒驗完」（1..440，預設 420；hook timeout 是 480）。
 
 帳本：`~/.claude/state/post-edit-check/ledger.tsv` 與 `~/.claude/state/subagent-verify/ledger.tsv`（只在本機、不印出）。
+
+GitHub Actions 會在每張 PR 及每次推送至 `main` 時執行 `bash tests/run.sh`。要擋下未通過的合併，請在分支規則中將 `verify-loop tests` 設為必要檢查。
 
 ## 伺服器端硬擋：用 CODEOWNERS 保護測試
 本機的測試守衛可以被繞過（先 commit 再改測試），交給 GitHub 擋：把 `examples/CODEOWNERS` 複製到 `.github/CODEOWNERS`，填上測試路徑和負責人，預設分支要求 PR 與 Code Owner 審核（管理員也適用）。AI 必須用另一個帳號 push，因為 GitHub 不准帳號核准自己的 PR。公開 repo 免費；私人 repo 需付費方案。
@@ -81,7 +85,7 @@
 - 「機器太忙」要能故意重現。在測試行程裡卡住事件迴圈可以重現；開二十個空轉的 CPU 行程不行。
 - 證據要在乾淨的 `PATH` 產生。兩次全套測試各假失敗 44、39 個，原因是舊的系統直譯器和一個攔截 shim。
 - 新寫的檢查也會不穩。只留「要驗的那一個訊號」是真的，其餘注入，再把舊錯放回去，看檢查會不會失敗。
-- 流程通過不算證明，截圖要看得到功能地圖承諾的東西。有一條流程靠內部狀態通過，但它聲稱的東西不在畫面內；後來又在它被浮層蓋住時通過。那個專案現在要求截圖前後都看得到沒被蓋住的標籤。
+- 某款遊戲的幫手已經載入，卻可能跑到畫面外或被 HUD 蓋住。操作工具現在檢查玩家看得到幫手，而且幫手確實移動。移除預設幫手時流程報失敗，還原後連跑十次通過。
 - 要操作使用者拿到的那個版本。第一版操作工具 build 時沒開正式功能旗標，四條流程是在使用者看不到的畫面上通過的。
 - 圖要對得上程式。截圖上的 commit 編號必須就是那個 commit 的 build。那個專案的操作工具把未提交的 build 標成 `+dirty`，並拒絕別的狀態 build 出來的執行個體。
 - 會啟動行程的驗證工具，關行程前要先證明那是自己開的。重開機後，紀錄的 PID 不算證明；要一起記啟動時間與指令列。

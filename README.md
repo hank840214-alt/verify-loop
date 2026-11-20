@@ -28,6 +28,8 @@ If you build software by talking to Claude Code, Codex or Gemini CLI, you cannot
 ```
 The plugin registers the Stop hook and the two new hooks. They do nothing until you register a project.
 
+To upgrade an existing installation, run `claude plugin marketplace update verify-loop` and `claude plugin update verify-loop@verify-loop`, then restart Claude Code. Version 0.1.1 runs hook commands and quoted evidence commands with Bash `pipefail`, so a failed test in `test-command | tee log` propagates through the pipeline. Pass separate arguments to the evidence tool to execute a program directly.
+
 ### Register a project for the Stop hook
 Copy `examples/stop-verify.projects.json` to `~/.claude/stop-verify.projects.json` and edit it. The key is `owner/repo` from your `origin` remote (for `git@github.com:alice/shop.git` it is `alice/shop`), so a different owner's clone with the same name never matches. `roots` is required: the absolute paths of the checkouts you trust. Any other checkout, even of the same repo, is never run.
 
@@ -93,6 +95,8 @@ The local test guard can be bypassed (commit first, then edit the tests). Let Gi
 macOS or Linux, `bash`, `jq`, `perl`, `git`, `shasum`. Codex CLI for the dispatch script. Tested with Claude Code 2.1.326 and Codex CLI 0.164.0.
 
 ## Tests
+GitHub Actions runs the suite for each PR and each push to `main`. To enforce it before merging, select `verify-loop tests` as a required status check in the branch rules.
+
 ```
 bash tests/run.sh
 ```
@@ -127,7 +131,7 @@ From the first real runs, on one app with a server and a browser client. The dri
 - Reproduce "the machine was busy" on purpose. Blocking the event loop inside the test process reproduced it; twenty idle-spinning CPU processes did not.
 - Produce evidence with a clean `PATH`. Two full runs showed 44 and 39 false failures from an old system interpreter and from a shim.
 - A new check can be flaky too. Keep only the one signal under test real, inject the rest, then put the old mistake back and see the check fail.
-- A flow that passes is not proof until the screenshot shows what the feature map promises. One flow passed on internal state while the thing it claimed was off screen, and later while it sat under an overlay. In that project the check now requires the visible label, uncovered, before and after the shot.
+- In a game, the helper existed in memory but could be off screen or covered by the HUD. The driver now checks visibility and movement. Removing the default helper made the flow fail. After restoring it, the flow passed ten consecutive runs.
 - Drive the build your users get. The first driver built without the production feature flags, so four flows passed on screens no user sees.
 - Tie the picture to the code. A screenshot stamped with a commit id must come from that commit. That project's driver stamps an uncommitted build `+dirty` and refuses a running instance built from another state.
 - A verification tool that starts processes must prove a process is its own before it stops it. A recorded PID is not proof after a reboot; record the start time and command line too.
