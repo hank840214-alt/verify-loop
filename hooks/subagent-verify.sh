@@ -9,7 +9,8 @@
 #     exit 2 keeps the subagent running. On a host that has the tool, SubagentStop arrives after
 #     the report is in, so exit 2 there is useless; hence the dedupe below.
 # Dedupe: each hand-back starts a fresh snapshot. Stop skips checkouts whose fingerprint the
-#   latest hand-back passed or blocked. Incomplete checks remain eligible to run at stop.
+#   latest hand-back checked. An unfinished check stays unverified. A delivered report cannot
+#   be recalled at stop. Later changes to the shared checkout are reported as unverified.
 #   On a SubagentStop-only host nothing writes that record, so every check runs as before.
 #   Loop guard: the cap of 2 blocks per agent (and once per fingerprint) bounds SubagentStop too,
 #   whatever stop_hook_active says; no second mechanism.
@@ -123,8 +124,12 @@ if [[ "$EVENT" != SubagentStop ]]; then
   # dirname(transcript_path)/<session_id>/subagents/agent-<agent_id>.jsonl
   [[ "$TOOLN" == SubagentHandback ]] || exit 0
   PRE=1
+fi
+if [[ -z "$T" ]]; then
   MT="$(j '.transcript_path // empty')"; MT="${MT/#\~/$HOME}"; RAWS="$(j '.session_id // empty')"
-  if [[ -z "$T" && -n "$MT" && -n "$RAWS" && -n "$AGENT" ]]; then T="$(dirname "$MT")/$RAWS/subagents/agent-$AGENT.jsonl"; fi
+  if [[ "$MT" == /* && "$RAWS" =~ ^[A-Za-z0-9_-]+$ && "$AGENT" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    T="$(dirname "$MT")/$RAWS/subagents/agent-$AGENT.jsonl"
+  fi
 fi
 [[ -n "$AGENT" ]] || AGENT="$(basename "${T:-noagent}" .jsonl)"
 AGENT="${AGENT//[^A-Za-z0-9_-]/_}"
@@ -138,6 +143,8 @@ if (( PRE )); then
   # keeps its own file descriptor, so its later verdicts cannot enter the new snapshot.
   if HF_TMP="$(mktemp "$HF.XXXXXX")" && { exec 3>"$HF_TMP"; } && [[ ! -d "$HF" ]] && mv -f "$HF_TMP" "$HF"; then
     HF_TMP=""; RECORD_HANDBACK=1
+    CALL_ID="$(j '.tool_use_id // empty')"
+    [[ "$CALL_ID" =~ ^[A-Za-z0-9_:-]+$ ]] && printf 'call %s\n' "$CALL_ID" >&3
   else
     /bin/rm -f "$HF" 2>/dev/null || { : > "$HF"; } 2>/dev/null
     NOTES+="Could not refresh the hand-back record. "
@@ -152,8 +159,31 @@ if [[ -z "$T" || ! -f "$T" ]]; then
   msg "Cannot read the subagent's transcript; not verified."
   exit 0
 fi
-if ! jq -n '[inputs]|length' "$T" >/dev/null 2>&1; then
+# Only a successful tool result in this agent's transcript confirms delivery. A later
+# tool call starts new work and invalidates the receipt. A PreToolUse allow is not delivery.
+DELIVERED=""
+if (( PRE )); then
+  TRANSCRIPT_QUERY='reduce inputs as $row (0; .)'
+else
+  TRANSCRIPT_QUERY='
+    reduce (inputs | . as $row | .message.content? | arrays | .[] | objects | [$row.type, .]) as [$role, $c]
+      ({id:null, delivered:false};
+       if $role == "assistant" and $c.type == "tool_use" then
+         {id:(if $c.name == "SubagentHandback" then $c.id else null end), delivered:false}
+       elif $role == "user" and $c.type == "tool_result" and .id != null and $c.tool_use_id == .id then
+         .delivered = (($c.is_error // false) == false)
+       else . end)
+    | if .delivered then (.id | strings | select(test("^[A-Za-z0-9_:-]+$"))) else empty end'
+fi
+if ! RESULT="$(jq -nr "$TRANSCRIPT_QUERY" "$T" 2>/dev/null)"; then
   led "-" error; msg "The subagent's transcript could not be parsed; not verified."; exit 0
+fi
+SNAPSHOT=""
+if (( ! PRE )); then
+  DELIVERED="$RESULT"
+  if [[ -f "$HF" && -w "$STATE_DIR" ]]; then SNAPSHOT="$(cat "$HF" 2>/dev/null)" || SNAPSHOT=""; fi
+  # A receipt from a different attempt cannot authenticate these results.
+  if [[ -n "$DELIVERED" ]] && ! grep -qxF "call $DELIVERED" <<< "$SNAPSHOT"; then SNAPSHOT=""; fi
 fi
 
 # --- 1. what the subagent changed, from its own transcript ---
@@ -330,12 +360,17 @@ for ROOT in "${UROOTS[@]}"; do
 
   fingerprint "$ROOT"; FP="$FPRES"
   if [[ ${#FP} != 40 ]]; then led "$KEY" error; NOTES+="$NAME: could not list or hash the changes (a repo with no commit, or an unreadable file); not verified. "; continue; fi
-  # Old plugin versions appended bare fingerprints across attempts. Only use fresh snapshots.
-  if (( ! PRE )) && [[ -w "$STATE_DIR" ]] && grep -qxF "current $FP" "$HF" 2>/dev/null; then
-    if grep -qxF "$FP" "$BF" 2>/dev/null; then
-      NOTES+="$NAME: the hand-back check failed for this state; not verified. "
+  if (( ! PRE )); then
+    if grep -qxF "failed $FP" <<< "$SNAPSHOT"; then
+      led "$KEY" handback-done; NOTES+="$NAME: the hand-back check failed; not verified. "; continue
     fi
-    led "$KEY" handback-done; continue   # the hand-back path already judged this exact state
+    if grep -qxF "passed $FP" <<< "$SNAPSHOT"; then led "$KEY" handback-done; continue; fi
+    if grep -qxF "started $FP" <<< "$SNAPSHOT"; then
+      led "$KEY" handback-done; NOTES+="$NAME: the hand-back check did not finish with a verdict; not verified. "; continue
+    fi
+    if [[ -n "$DELIVERED" ]]; then
+      led "$KEY" handback-done; NOTES+="$NAME: the report was delivered without a verified result for this checkout state; not verified. "; continue
+    fi
   fi
   if grep -qxF "$FP" "$BF" 2>/dev/null; then
     led "$KEY" repeat; NOTES+="$NAME: this exact state was already blocked once and is not re-run; not verified. "; continue
@@ -355,6 +390,7 @@ for ROOT in "${UROOTS[@]}"; do
     if [[ "${ER[$i]}" == "$ROOT" && -f "$pf" && ! -L "$pf" ]]; then printf '%s\n' "${pf#"$ROOT"/}"; fi
     i=$((i + 1))
   done > "$LIST"
+  (( RECORD_HANDBACK )) && printf 'started %s\n' "$FP" >&3
   LEFT=$((BUDGET - (SECONDS - START)))   # recomputed right before the run
   if (( LEFT < 3 )); then led "$KEY" timeout; NOTES+="$NAME: out of time; not verified. "; /bin/rm -f "$LOG" "$LIST"; LOG=""; LIST=""; continue; fi
   (( LIMIT < LEFT )) && LEFT=$LIMIT
@@ -375,7 +411,7 @@ for ROOT in "${UROOTS[@]}"; do
   elif (( TRC == 126 || TRC == 127 || TRC > 128 )); then VERDICT=error
   else VERDICT=fail; fi
   case "$VERDICT" in
-    pass)    led "$KEY" pass; (( RECORD_HANDBACK )) && printf 'current %s\n' "$FP" >&3; PASS_TEXT+="$NAME: checks passed (${EL} s). " ;;
+    pass)    led "$KEY" pass; (( RECORD_HANDBACK )) && printf 'passed %s\n' "$FP" >&3; PASS_TEXT+="$NAME: checks passed (${EL} s). " ;;
     timeout) led "$KEY" timeout; NOTES+="$NAME: checks did not finish within ${LEFT} s; not verified. " ;;
     error)   led "$KEY" error; NOTES+="$NAME: the check command could not run or was killed (rc=${TRC}); not a test failure; not verified. " ;;
     fail)
@@ -392,7 +428,14 @@ for ROOT in "${UROOTS[@]}"; do
       fi
       case "$DEC" in
         block)
-          (( RECORD_HANDBACK )) && printf 'current %s\n' "$FP" >&3
+          if (( RECORD_HANDBACK )); then
+            printf 'failed %s\n' "$FP" >&3
+            # Coverage and other output can change the checkout during the failing run.
+            # Remember that state only as a failure notice, never as a passing result.
+            if fingerprint "$ROOT" && [[ ${#FPRES} == 40 && "$FPRES" != "$FP" ]]; then
+              printf 'failed %s\n' "$FPRES" >&3
+            fi
+          fi
           led "$KEY" fail
           FAIL_TEXT+="$(printf '[%s] the check command failed (exit %d, %d s). Last output:' "$NAME" "$TRC" "$EL")"$'\n'
           FAIL_TEXT+="$(tail -40 "$LOG" | LC_ALL=C cut -c1-300)"$'\n'
