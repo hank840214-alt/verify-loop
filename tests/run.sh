@@ -625,6 +625,29 @@ pre a2 SubagentHandback sOther; lrc "L2: wrong session folder (path is derived f
 TA="$(agent e1)"; tr_edit "$TA" "$SR/src/main.txt"; setmain BAD
 printf '%s' "$(jq -nc --arg t "$TA" --arg c "$SRP" '{session_id:"s9",agent_id:"e1",hook_event_name:"SubagentStop",stop_hook_active:false,cwd:$c,agent_transcript_path:$t}')" | bash "$SV" >"$T/sout" 2>"$T/serr"; RC=$?
 lrc "L2: SubagentStop input still works -> 2" 2; has "L2: ... wording says finish" "$(cat "$T/serr")" "Before you finish"
+# SubagentStop registered too (hosts without SubagentHandback, and hosts with both)
+stopin() {  # agent_id [stop_hook_active]; transcript at the agent() path, session sPre
+  jq -nc --arg a "$1" --arg t "$PRJ/sPre/subagents/agent-$1.jsonl" --arg c "$SRP" --argjson h "${2:-false}" '{session_id:"sPre",agent_id:$a,hook_event_name:"SubagentStop",stop_hook_active:$h,cwd:$c,agent_transcript_path:$t}'
+}
+stp() { stopin "$@" | bash "$SV" >"$T/sout" 2>"$T/serr"; RC=$?; OUT="$(cat "$T/sout")"; ERR="$(cat "$T/serr")"; }
+# SubagentStop only: fail -> exit 2 -> fixed -> pass
+sconf "$GOODCHK"; setmain BAD; TA="$(agent st1)"; tr_edit "$TA" "$SR/src/main.txt"
+stp st1; lrc "L2 stop-only: failing check -> 2" 2; has "L2 stop-only: ... block 1/2 text" "$ERR" "block 1/2"
+setmain OK; stp st1 true; lrc "L2 stop-only: fixed (stop_hook_active true) -> 0" 0; [[ "$(lastled "$SL" 4)" == pass && "$(runs)" == 2 ]] && ok "L2 stop-only: ... ledger pass, check ran again" || bad "L2 stop-only: pass ($(runs) runs)"
+# SubagentStop only: cap of 2 blocks holds, also with stop_hook_active true
+sconf "$GOODCHK"; setmain BAD; TA="$(agent st2)"; tr_edit "$TA" "$SR/src/main.txt"
+stp st2; lrc "L2 stop-only cap: block 1 -> 2" 2
+setmain BAD2; stp st2 true; lrc "L2 stop-only cap: block 2 -> 2" 2
+setmain BAD3; stp st2 true; lrc "L2 stop-only cap: third failing state -> 0" 0; [[ "$(lastled "$SL" 4)" == capped ]] && ok "L2 stop-only cap: ... ledger capped" || bad "L2 stop-only cap: ledger"
+# both events: hand-back pass, then SubagentStop for the same state -> no second run
+sconf "$GOODCHK"; setmain OK; TA="$(agent bo1)"; tr_edit "$TA" "$SR/src/main.txt"
+pre bo1 SubagentHandback; lrc "L2 both: hand-back, checks pass -> 0" 0
+stp bo1; lrc "L2 both: SubagentStop same state -> 0" 0; [[ "$(lastled "$SL" 4)" == handback-done && "$(runs)" == 1 && -z "$OUT$ERR" ]] && ok "L2 both: ... ledger handback-done, one run only, silent" || bad "L2 both: ($(runs) runs, $(lastled "$SL" 4))"
+setmain OK2; stp bo1; [[ "$(runs)" == 2 ]] && ok "L2 both: state changed after hand-back -> SubagentStop checks again" || bad "L2 both: changed state not re-run ($(runs))"
+# both events: hand-back blocked, then SubagentStop for the same failing state -> no second run, no second block
+sconf "$GOODCHK"; setmain BAD; TA="$(agent bo2)"; tr_edit "$TA" "$SR/src/main.txt"
+pre bo2 SubagentHandback; lrc "L2 both: hand-back, failing -> 2" 2
+stp bo2; lrc "L2 both: SubagentStop same failing state -> 0" 0; [[ "$(lastled "$SL" 4)" == handback-done && "$(runs)" == 1 ]] && ok "L2 both: ... no second run after a block" || bad "L2 both: block then stop ($(runs) runs)"
 # block record cannot be written -> exit 0
 mkdir -p "$HOME/.claude/state/subagent-verify/sPre.f1.blocked"; TA="$(agent f1)"; tr_edit "$TA" "$SR/src/main.txt"; pre f1 SubagentHandback
 lrc "L2: block record not writable -> 0 (never an unrecorded block)" 0; has "L2: ... says so" "$OUT" "cannot be read"

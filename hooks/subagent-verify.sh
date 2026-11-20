@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 # subagent-verify.sh — layer 2: check a subagent's work before it hands in its report.
 #
-# Input: PreToolUse with tool_name SubagentHandback. That is the tool a subagent calls to hand
-#   in its report (observed on recent Claude Code). exit 2 blocks the hand-back and stderr goes
-#   to the subagent, which keeps working. Any other PreToolUse call exits 0 at once. On a host
-#   without that tool this hook never fires. A SubagentStop input is also understood (exit 2 keeps
-#   the subagent running), but the plugin does not register that event.
+# Input, two events, both registered by the plugin:
+#   PreToolUse with tool_name SubagentHandback: the tool a subagent calls to hand in its report.
+#     exit 2 blocks the hand-back and stderr goes to the subagent, which keeps working. Any other
+#     PreToolUse call exits 0 at once.
+#   SubagentStop: for hosts without that tool (Claude Code 2.1.329 sessions were seen without it).
+#     exit 2 keeps the subagent running. On a host that has the tool, SubagentStop arrives after
+#     the report is in, so exit 2 there is useless; hence the dedupe below.
+# Dedupe: when the PreToolUse path reached a verdict for this agent (pass, or block), it records
+#   the state fingerprint in <session>.<agent>.handback. A SubagentStop call for the same agent
+#   with the same fingerprint then exits 0 at once, ledger result "handback-done", no check run.
+#   On a SubagentStop-only host nothing writes that record, so every check runs as before.
+#   Loop guard: the cap of 2 blocks per agent (and once per fingerprint) bounds SubagentStop too,
+#   whatever stop_hook_active says; no second mechanism.
 #
 # What counts as "the subagent changed something", read from the subagent's OWN transcript:
 #   (a) a file written by Edit / Write / MultiEdit / NotebookEdit whose tool result was not an error;
@@ -39,7 +47,7 @@
 # Test-only overrides SUBVERIFY_STATE and SUBVERIFY_TOTAL are ignored when this script lives under
 # ~/.claude. They never touch trust: trust is only "roots".
 # Ledger: ~/.claude/state/subagent-verify/ledger.tsv  (time, project, agent, result, seconds)
-#   result: pass | fail | timeout | error | repeat | capped | no-change | no-transcript | skip
+#   result: pass | fail | timeout | error | repeat | capped | no-change | no-transcript | skip | handback-done
 set -uo pipefail
 START=$SECONDS
 SELF="${BASH_SOURCE[0]}"
@@ -124,7 +132,7 @@ AGENT="${AGENT//[^A-Za-z0-9_-]/_}"
 
 (umask 077; mkdir -p "$STATE_DIR") 2>/dev/null || { msg "Cannot create the state folder; not verified."; exit 0; }
 # prune only this hook's own block records (<session>.<agent>.blocked, this folder only), after 30 days
-find "$STATE_DIR" -maxdepth 1 -type f -name '[A-Za-z0-9_-]*.[A-Za-z0-9_-]*.blocked' -mtime +30 -delete 2>/dev/null
+find "$STATE_DIR" -maxdepth 1 -type f \( -name '[A-Za-z0-9_-]*.[A-Za-z0-9_-]*.blocked' -o -name '[A-Za-z0-9_-]*.[A-Za-z0-9_-]*.handback' \) -mtime +30 -delete 2>/dev/null
 [[ -n "$HASH" ]] || { led "-" error; msg "shasum/sha1sum missing; not verified."; exit 0; }
 # No fallback to the main session transcript: it would blame the subagent for the parent's edits.
 if [[ -z "$T" || ! -f "$T" ]]; then
@@ -248,6 +256,7 @@ fi
 # --- 2. per checkout: guard, fingerprint, run the check ---
 LOCKD="$STATE_DIR/$SESSION.$AGENT.lock"
 BF="$STATE_DIR/$SESSION.$AGENT.blocked"
+HF="$STATE_DIR/$SESSION.$AGENT.handback"   # fingerprints the hand-back path reached a verdict for
 sleep_s() { perl -e 'select(undef,undef,undef,$ARGV[0])' "$1"; }
 lock_acquire() {
   local n=0
@@ -311,6 +320,9 @@ for ROOT in "${UROOTS[@]}"; do
 
   fingerprint "$ROOT"; FP="$FPRES"
   if [[ ${#FP} != 40 ]]; then led "$KEY" error; NOTES+="$NAME: could not list or hash the changes (a repo with no commit, or an unreadable file); not verified. "; continue; fi
+  if (( ! PRE )) && grep -qxF "$FP" "$HF" 2>/dev/null; then
+    led "$KEY" handback-done; continue   # the hand-back path already judged this exact state
+  fi
   if grep -qxF "$FP" "$BF" 2>/dev/null; then
     led "$KEY" repeat; NOTES+="$NAME: this exact state was already blocked once and is not re-run; not verified. "; continue
   fi
@@ -349,7 +361,7 @@ for ROOT in "${UROOTS[@]}"; do
   elif (( TRC == 126 || TRC == 127 || TRC > 128 )); then VERDICT=error
   else VERDICT=fail; fi
   case "$VERDICT" in
-    pass)    led "$KEY" pass; PASS_TEXT+="$NAME: checks passed (${EL} s). " ;;
+    pass)    led "$KEY" pass; (( PRE )) && printf '%s\n' "$FP" >> "$HF" 2>/dev/null; PASS_TEXT+="$NAME: checks passed (${EL} s). " ;;
     timeout) led "$KEY" timeout; NOTES+="$NAME: checks did not finish within ${LEFT} s; not verified. " ;;
     error)   led "$KEY" error; NOTES+="$NAME: the check command could not run or was killed (rc=${TRC}); not a test failure; not verified. " ;;
     fail)
@@ -366,6 +378,7 @@ for ROOT in "${UROOTS[@]}"; do
       fi
       case "$DEC" in
         block)
+          (( PRE )) && printf '%s\n' "$FP" >> "$HF" 2>/dev/null
           led "$KEY" fail
           FAIL_TEXT+="$(printf '[%s] the check command failed (exit %d, %d s). Last output:' "$NAME" "$TRC" "$EL")"$'\n'
           FAIL_TEXT+="$(tail -40 "$LOG" | LC_ALL=C cut -c1-300)"$'\n'

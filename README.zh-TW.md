@@ -14,7 +14,7 @@
 | `skills/debug` | 說「debug」。模型自己分流：一般 bug、效能、狀態與時序、改動會影響哪裡。 |
 | `hooks/stop-verify.sh` | 停止 hook。AI 要收工時，若登記的專案有改到程式，就跑該專案的檢查。失敗或超時 → `exit 2`，但同一個狀態只擋一次、不重跑，之後 AI 可以收工並看到 NOT VERIFIED。設了 `tests_re` 時，同一批改動又改程式又改既有測試也會被擋一次；它只看還沒 commit 的改動，已 commit 的測試改動由 `verify-evidence.sh` 列給審查者。hook 自己壞掉時不會卡住 session。 |
 | `hooks/post-edit-check.sh` | PostToolUse hook（`Edit`、`Write`、`MultiEdit`），第 1 層。在登記且設了 `edit_check` 的專案裡，每次改檔後跑那個快速檢查（例如 `tsc`），只有「檢查失敗，而且輸出裡有一行點名剛改的那個檔」才擋（`exit 2`）。別的檔有錯不管。逾時、找不到工具、hook 自己出錯都不會擋。 |
-| `hooks/subagent-verify.sh` | 針對 `SubagentHandback` 的 PreToolUse hook，第 2 層。子代理要交報告前，從它自己的對話紀錄判斷有沒有改到受信任的 checkout，有就跑該專案的檢查。失敗就擋下交報告（`exit 2`），子代理繼續修。每個子代理最多擋 2 次，同一個確切狀態只擋一次。 |
+| `hooks/subagent-verify.sh` | 第 2 層，同時註冊為 `SubagentHandback` 的 PreToolUse hook 和 `SubagentStop` hook。子代理要交報告前（沒有那個工具的環境則是要停下前），從它自己的對話紀錄判斷有沒有改到受信任的 checkout，有就跑該專案的檢查。失敗就擋下（`exit 2`），子代理繼續修。每個子代理最多擋 2 次，同一個確切狀態只擋一次。如果交報告那一關已經判過同一個狀態，`SubagentStop` 那次直接 `exit 0`（帳本記 `handback-done`）。 |
 | `tools/codex-dispatch.sh` | 只接受白名單參數的 `codex exec` 包裝：唯讀或可寫工作區、預設斷網（指 Codex 執行的指令；prompt 與圖片仍會送到模型服務；呼叫者可加 `--net`）、不載入使用者設定、可寫模式只能改目前所在的 repo（或你列出的 repo）、報告只能寫到 `<repo>/.scratch/` 或 `/tmp`。 |
 | `tools/verify-evidence.sh` | 跑檢查並產生綁 commit 的證據段：SHA、指令、結束碼、log 雜湊、它在 `PATH` 上找到的 `node` 與 `python3`（`--tool <名稱>` 可加列；路徑會遮罩，貼出前仍請看過那一行）、有沒有改到既有測試。同一分支新增後又修改的測試列在獨立標題下。腳本不改 `PATH`：工具那一行出現 shim 或舊版直譯器，就修好 `PATH` 再重跑。工作區不乾淨就拒跑；中途有變動或無法檢查測試改動時結束碼 90（INVALID）。預設不印 log 內容，要附 log 尾段用 `--tail N`；但會印出完整指令，密碼請用環境變數傳，貼到公開 PR 前先看過整段。指令若改檔再改回，本機證據看不出來；真正的關卡是 CI 在乾淨 checkout 上重跑。 |
 | `docs/METHOD.zh-TW.md` | 一頁說完方法。 |
@@ -56,7 +56,7 @@
 - 同一個 checkout 同時收工，可能各自跑檢查、各自被擋；另一個 session 記下的通過，可能蓋過這個 session 先前對同一份程式的失敗。
 - 只要登記的 repo 有改動（包括你自己沒做完的），hook 就會觸發。失敗不是這個 session 造成時，Claude 被要求說明並停手，但它仍可能去改。
 - 第 1 層（`post-edit-check.sh`）在改檔之後才跑，無法還原那次編輯，只能告訴 Claude。只有點名被改檔案的輸出行才會擋，所以不印路徑的工具永遠不會擋。
-- 第 2 層（`subagent-verify.sh`）需要 `SubagentHandback` 這個工具，也就是子代理交報告時呼叫的那個。在較新的 Claude Code 上觀察到有它。沒有它的環境裡，這個 hook 永遠不會觸發，什麼都不會檢查。
+- 第 2 層（`subagent-verify.sh`）在環境有 `SubagentHandback` 時，於那個工具呼叫處執行；沒有時改在 `SubagentStop` 執行。兩個事件都有註冊。Claude Code 2.1.329 的 session 觀察到沒有 `SubagentHandback`，而 `SubagentStop` 在那裡有效（失敗、修好、通過）。兩者都有的環境，由交報告那一關判定，同一個狀態的 `SubagentStop` 不做事。在較舊、`SubagentStop` 在報告交出後才來的環境，那裡的擋下來得太晚，沒有用。
 - 第 2 層面對的是共用的 checkout。失敗可能來自別的 session 的改動，所以擋下時的訊息會這樣說，並要求子代理不要去還原不是自己的改動。
 - 第 2 層靠字串比對（`>`、`sed -i`、`mv`、`git checkout` 等）加路徑名稱，找出子代理用 Bash 寫的檔。可能漏掉，也可能把無害的指令算進去。唯讀的 git（`status`、`log`、`diff`、`show`、`stash list`）不算寫入。
 - 第 2 層不管子代理改的是哪個檔，都會跑完整的 `handback_verify`。
@@ -91,6 +91,7 @@
 兩個新 hook（改檔後檢查、子代理交報告前檢查）在同一個專案第一天的紀錄（兩份帳本都還很小，只能算早期跡象，不是結論）：
 
 - hook 不能只靠單元測試，要在真的環境跑一次。第 2 層第一版聽的是「子代理結束」事件，212 個單元測試都過。實際使用時記了兩次失敗，卻沒有東西被修：擋下的訊息到的時候，子代理已經交出報告了。改掛在「交報告」這個工具呼叫之前，才跑出一次完整的 失敗 → 修好 → 通過。
+- hook 依賴的環境功能可能在版本之間消失：這個 hook 原本依賴的「交報告」工具，在較新的 session 裡不見了；兩個事件都註冊，檢查才繼續有效。
 - 時限要用忙碌機器的實測來定。全套測試在機器忙時要 133–226 秒，閒時估計 100–130 秒。第一版時限 200 秒，機器一忙就永遠是「未驗完」。
 - 檢查工具沒涵蓋的檔是「跳過」，不是「通過」。那個專案的型別檢查設定只涵蓋兩個資料夾，其他地方的改動被跳過、沒有檢查（當時跑的私人版本把它們記成 `skip`）。
 - 大多數子代理不改檔。第 2 層 17 筆紀錄裡有 11 筆是唯讀子代理，檢查對它們沒有成本。
