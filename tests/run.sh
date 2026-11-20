@@ -899,4 +899,19 @@ snap; pre t4 SubagentHandback; schk "T4: Bash call denied before it ran is ignor
 TA="$(agent t4b)"; tr_tool "$TA" Bash "$(jq -nc --arg c "printf x > \"$SRP/src/main.txt\" && false" '{command:$c}')" true /tmp
 snap; pre t4b SubagentHandback; schk "T4: ... while an ordinary failed Bash call still counts" t4b fail 2 1
 
+# A second hand-back supersedes the earlier result for every checkout it covers.
+# The simulated service lives outside the checkout, so its delay cannot change the fingerprint.
+sconf 'true' 'echo run >> "$RAN"; if [[ -f "$RAN.slow" ]]; then sleep 20; fi; grep -qx OK src/main.txt' 2
+setmain OK; echo BAD > "$SP2/src/main.txt"
+TA="$(agent latest)"; tr_edit "$TA" "$SR/src/main.txt"; tr_edit "$TA" "$SP2/src/main.txt"
+pre latest SubagentHandback; lrc "L2 latest: first hand-back blocks the failing checkout" 2
+touch "$RAN.slow"; echo OK > "$SP2/src/main.txt"
+pre latest SubagentHandback; lrc "L2 latest: second hand-back permits an incomplete check" 0
+has "L2 latest: second hand-back reports the timeout" "$OUT" "not verified"
+stp latest
+[[ "$RC" == 0 && "$(runs)" == 3 && "$OUT" == *'not verified'* ]] && ok "L2 latest: stop retries the timed-out checkout and reports a second timeout" || bad "L2 latest: stop after timeout (rc=$RC runs=$(runs) output=$OUT)"
+rm "$RAN.slow"; stp latest
+[[ "$RC" == 0 && "$(runs)" == 4 && "$OUT" == *'checks passed'* ]] && ok "L2 latest: stop sees recovery after actually running the check" || bad "L2 latest: recovery (rc=$RC runs=$(runs) output=$OUT)"
+[[ "$(awk -F'\t' '$2 == "acme/p2" {print $4}' "$SL" | paste -sd, -)" == fail,pass,handback-done,handback-done ]] && ok "L2 latest: both stops skip the checkout that passed its last hand-back" || bad "L2 latest: unexpected results for the other checkout"
+
 echo; echo "$pass passed, $fail failed"; (( fail == 0 ))
